@@ -5,7 +5,7 @@ This API provides access to manga data from KomikCast, a popular Indonesian mang
 ## Base URL
 
 ```
-http://localhost:5000  # Default development URL
+http://localhost:8080  # Default development URL
 ```
 
 ## Endpoints

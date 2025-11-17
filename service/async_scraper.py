@@ -162,7 +162,7 @@ class AsyncScraper:
         slugs = []
 
         # Kumpulkan data dasar dulu
-        for uta in soup.select(".listupd .uta"):
+        for uta in soup.select(".bixbox .listupd:not(.project) .uta"):
             komik_data = {
                 "title": (
                     uta.find("h3").get_text(strip=True) if uta.find("h3") else None

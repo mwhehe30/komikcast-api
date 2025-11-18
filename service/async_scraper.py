@@ -234,6 +234,25 @@ class AsyncScraper:
 
         # Kumpulkan data dasar dulu
         for uta in soup.select(".list-update_item"):
+            # Extract komik type directly from search results using the provided selector
+            type_element = uta.select_one("span.type")
+            komik_type = "Unknown"
+
+            if type_element:
+                # Ambil text dari element type (Manga, Manhwa, Manhua)
+                type_text = type_element.get_text(strip=True)
+                # Atau bisa juga dari class yang ada
+                class_list = type_element.get("class", [])
+                if "manga-bg" in class_list:
+                    komik_type = "Manga"
+                elif "manhwa-bg" in class_list:
+                    komik_type = "Manhwa"
+                elif "manhua-bg" in class_list:
+                    komik_type = "Manhua"
+                else:
+                    # Fallback ke text jika class tidak jelas
+                    komik_type = type_text if type_text else "Unknown"
+
             komik_data = {
                 "title": (
                     uta.find("h3").get_text(strip=True) if uta.find("h3") else None
@@ -271,7 +290,7 @@ class AsyncScraper:
                     if uta.find("img") and uta.find("img").has_attr("data-src")
                     else uta.find("img")["src"] if uta.find("img") else None
                 ),
-                "type": "Unknown",  # Default value
+                "type": komik_type,
             }
 
             if komik_data["slug"]:
@@ -279,12 +298,7 @@ class AsyncScraper:
 
             search_data.append(komik_data)
 
-        # Ambil type untuk semua komik sekaligus dengan async
-        if slugs:
-            type_mapping = await self.get_komik_types_batch(slugs)
-            for komik in search_data:
-                if komik["slug"] and komik["slug"] in type_mapping:
-                    komik["type"] = type_mapping[komik["slug"]]
+        # Karena type sudah diambil langsung dari halaman search, tidak perlu async batch
 
         has_next_page = bool(
             soup.select('a.next.page-numbers, .next.page-numbers, a[rel="next"]')

@@ -19,7 +19,7 @@ def create_app():
             "description": "API for scraping komikcast",
             "author": "Mwhehe30",
             "docs": "https://github.com/mwhehe30/komikcast-api",
-            "version": "1.0.1",
+            "version": "1.0.2",
         }
 
     @app.errorhandler(404)

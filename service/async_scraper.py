@@ -339,6 +339,7 @@ class AsyncScraper:
         soup = await self.scrape(chapter_url)
 
         chap = soup.select(".main-reading-area img")
+        komik_slug = soup.select_one(".allc a").get("href").rstrip("/").split("/")[-1]
         images = [c.get("src") for c in chap]
         title = soup.select_one("h1[itemprop='name']").get_text(strip=True)
         next_chapter = (
@@ -358,6 +359,7 @@ class AsyncScraper:
 
         return {
             "title": title,
+            "komik_slug": komik_slug,
             "next_chapter_slug": next_chapter,
             "previous_chapter_slug": prev_chapter,
             "images": images,

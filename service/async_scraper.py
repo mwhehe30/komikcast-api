@@ -1,6 +1,8 @@
 import re
 import asyncio
 import aiohttp
+import json
+import os
 from urllib.parse import quote, urlparse
 from bs4 import BeautifulSoup
 import dateparser
@@ -11,17 +13,45 @@ from typing import List, Dict, Any
 class AsyncScraper:
     def __init__(self, base_url):
         self.base_url = base_url
-        self.type_cache = {}
         self.session = None
+        self.cache_file = "komik_types.json"
+        self.type_cache = self._load_cache()
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+        }
+
+    def _load_cache(self):
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Error loading cache: {e}")
+                return {}
+        return {}
+
+    def _save_cache(self):
+        try:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.type_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error saving cache: {e}")
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(headers=self.headers)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.session.close()
+        if self.session:
+            await self.session.close()
+        # Save cache on exit
+        self._save_cache()
 
     def normalize_time(self, time_text):
+        if not time_text:
+            return datetime.now().isoformat()
         parsed = dateparser.parse(time_text, languages=["id", "en"])
         return parsed.isoformat() if parsed else datetime.now().isoformat()
 
@@ -38,7 +68,7 @@ class AsyncScraper:
         target_url = url if url else self.base_url
         async with self.session.get(target_url) as response:
             html = await response.text()
-            return BeautifulSoup(html, "html.parser")
+            return BeautifulSoup(html, "lxml")
 
     async def get_komik_type_from_detail(self, slug):
         """Mengambil tipe komik dari halaman detail dengan async"""
@@ -69,24 +99,33 @@ class AsyncScraper:
 
         except Exception as e:
             print(f"Error getting type for {slug}: {e}")
-            self.type_cache[slug] = "Unknown"
             return "Unknown"
 
     async def get_komik_types_batch(self, slugs: List[str]) -> Dict[str, str]:
         """Mengambil type untuk multiple slugs sekaligus dengan asyncio"""
-        tasks = [self.get_komik_type_from_detail(slug) for slug in slugs]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        slugs_to_fetch = [slug for slug in slugs if slug not in self.type_cache]
 
-        # Handle exceptions
-        type_mapping = {}
-        for slug, result in zip(slugs, results):
-            if isinstance(result, Exception):
-                print(f"Error processing {slug}: {result}")
-                type_mapping[slug] = "Unknown"
-            else:
-                type_mapping[slug] = result
+        if slugs_to_fetch:
+            tasks = [self.get_komik_type_from_detail(slug) for slug in slugs_to_fetch]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # Cache is updated in get_komik_type_from_detail
 
-        return type_mapping
+        return {slug: self.type_cache.get(slug, "Unknown") for slug in slugs}
+
+    def _extract_type_from_list(self, element):
+        """Helper to extract type from an element if available (e.g. search results)"""
+        type_element = element.select_one("span.type")
+        if type_element:
+            type_text = type_element.get_text(strip=True)
+            class_list = type_element.get("class", [])
+            if "manga-bg" in class_list:
+                return "Manga"
+            elif "manhwa-bg" in class_list:
+                return "Manhwa"
+            elif "manhua-bg" in class_list:
+                return "Manhua"
+            return type_text if type_text else "Unknown"
+        return "Unknown"
 
     async def get_all_komik(self, page: int):
         url = f"{self.base_url}daftar-komik/page/{page}/"
@@ -95,7 +134,6 @@ class AsyncScraper:
         all_komik_data = []
         slugs = []
 
-        # Kumpulkan data dasar dulu
         for uta in soup.select(".list-update_item"):
             komik_data = {
                 "title": (
@@ -134,7 +172,7 @@ class AsyncScraper:
                     if uta.find("img") and uta.find("img").has_attr("data-src")
                     else uta.find("img")["src"] if uta.find("img") else None
                 ),
-                "type": "Unknown",  # Default value
+                "type": "Unknown",
             }
 
             if komik_data["slug"]:
@@ -142,7 +180,6 @@ class AsyncScraper:
 
             all_komik_data.append(komik_data)
 
-        # Ambil type untuk semua komik sekaligus dengan async
         if slugs:
             type_mapping = await self.get_komik_types_batch(slugs)
             for komik in all_komik_data:
@@ -161,7 +198,6 @@ class AsyncScraper:
         latest_release_data = []
         slugs = []
 
-        # Kumpulkan data dasar dulu
         for uta in soup.select(".bixbox .listupd:not(.project) .uta"):
             komik_data = {
                 "title": (
@@ -202,7 +238,7 @@ class AsyncScraper:
                     if uta.select_one("ul li span i")
                     else None
                 ),
-                "type": "Unknown",  # Default value
+                "type": "Unknown",
             }
 
             if komik_data["slug"]:
@@ -210,12 +246,19 @@ class AsyncScraper:
 
             latest_release_data.append(komik_data)
 
-        # Ambil type untuk semua komik sekaligus dengan async
         if slugs:
+            # Fetch types for current slugs
             type_mapping = await self.get_komik_types_batch(slugs)
             for komik in latest_release_data:
                 if komik["slug"] and komik["slug"] in type_mapping:
                     komik["type"] = type_mapping[komik["slug"]]
+
+            # PRUNE CACHE: Keep only slugs that are in the current latest list
+            # Note: This is aggressive. It means if you visit 'get_all_komik', those types are cached,
+            # but if you then visit 'get_latest_komik', they are wiped if not in latest.
+            # Based on user request "yg sudah tidak ada di latest update... dihapus judulnya", this is correct.
+            self.type_cache = {k: v for k, v in self.type_cache.items() if k in slugs}
+            self._save_cache()
 
         return latest_release_data
 
@@ -230,29 +273,8 @@ class AsyncScraper:
         soup = await self.scrape(search_url)
 
         search_data = []
-        slugs = []
 
-        # Kumpulkan data dasar dulu
         for uta in soup.select(".list-update_item"):
-            # Extract komik type directly from search results using the provided selector
-            type_element = uta.select_one("span.type")
-            komik_type = "Unknown"
-
-            if type_element:
-                # Ambil text dari element type (Manga, Manhwa, Manhua)
-                type_text = type_element.get_text(strip=True)
-                # Atau bisa juga dari class yang ada
-                class_list = type_element.get("class", [])
-                if "manga-bg" in class_list:
-                    komik_type = "Manga"
-                elif "manhwa-bg" in class_list:
-                    komik_type = "Manhwa"
-                elif "manhua-bg" in class_list:
-                    komik_type = "Manhua"
-                else:
-                    # Fallback ke text jika class tidak jelas
-                    komik_type = type_text if type_text else "Unknown"
-
             komik_data = {
                 "title": (
                     uta.find("h3").get_text(strip=True) if uta.find("h3") else None
@@ -290,15 +312,10 @@ class AsyncScraper:
                     if uta.find("img") and uta.find("img").has_attr("data-src")
                     else uta.find("img")["src"] if uta.find("img") else None
                 ),
-                "type": komik_type,
+                "type": self._extract_type_from_list(uta),
             }
 
-            if komik_data["slug"]:
-                slugs.append(komik_data["slug"])
-
             search_data.append(komik_data)
-
-        # Karena type sudah diambil langsung dari halaman search, tidak perlu async batch
 
         has_next_page = bool(
             soup.select('a.next.page-numbers, .next.page-numbers, a[rel="next"]')
@@ -310,32 +327,41 @@ class AsyncScraper:
         detail_url = self.base_url + href
         soup = await self.scrape(detail_url)
 
-        title = soup.find("h1", itemprop="headline").get_text(strip=True)
-        synopsis = self.normalize_text(
-            soup.select_one('[itemprop="articleBody"]').get_text(strip=True)
-        )
-        komik_type = soup.select_one("span.komik_info-content-info-type a").get_text(
-            strip=True
-        )
-        status = soup.select_one(
-            "span.komik_info-content-info b:contains('Status:')"
-        ).next_sibling.get_text(strip=True)
+        title_elem = soup.find("h1", itemprop="headline")
+        title = title_elem.get_text(strip=True) if title_elem else ""
+
+        synopsis_elem = soup.select_one('[itemprop="articleBody"]')
+        synopsis = self.normalize_text(synopsis_elem.get_text(strip=True)) if synopsis_elem else ""
+
+        type_elem = soup.select_one("span.komik_info-content-info-type a")
+        komik_type = type_elem.get_text(strip=True) if type_elem else "Unknown"
+
+        status_elem = soup.select_one("span.komik_info-content-info b:contains('Status:')")
+        status = status_elem.next_sibling.get_text(strip=True) if status_elem and status_elem.next_sibling else "Unknown"
+
+        rating_elem = soup.select_one(".data-rating")
         rating = (
-            float(soup.select_one(".data-rating").get("data-ratingkomik"))
-            if soup.select_one(".data-rating").get("data-ratingkomik")
+            float(rating_elem.get("data-ratingkomik"))
+            if rating_elem and rating_elem.get("data-ratingkomik")
             else None
         )
+
         genres = [g.text for g in soup.select("span.komik_info-content-genre a")]
-        thumbnail = soup.select_one("[itemprop='image'] img").get("src")
+
+        img_elem = soup.select_one("[itemprop='image'] img")
+        thumbnail = img_elem.get("src") if img_elem else None
+
         chapter_time = soup.select("ul#chapter-wrapper li .chapter-link-time")
-        chapters = [
-            {
+        chapter_links = soup.select("ul#chapter-wrapper li a")
+
+        chapters = []
+        for i, c in enumerate(chapter_links):
+            time_text = chapter_time[i].text.strip() if i < len(chapter_time) else ""
+            chapters.append({
                 "title": self.normalize_text(c.text),
                 "slug": urlparse(c["href"]).path.strip("/").split("/")[-1],
-                "released_at": self.normalize_time(chapter_time[i].text.strip()),
-            }
-            for i, c in enumerate(soup.select("ul#chapter-wrapper li a"))
-        ]
+                "released_at": self.normalize_time(time_text),
+            })
 
         return {
             "title": title,
@@ -353,21 +379,26 @@ class AsyncScraper:
         soup = await self.scrape(chapter_url)
 
         chap = soup.select(".main-reading-area img")
-        komik_slug = soup.select_one(".allc a").get("href").rstrip("/").split("/")[-1]
-        images = [c.get("src") for c in chap]
-        title = soup.select_one("h1[itemprop='name']").get_text(strip=True)
+
+        komik_link = soup.select_one(".allc a")
+        komik_slug = komik_link.get("href").rstrip("/").split("/")[-1] if komik_link else None
+
+        images = [c.get("src") for c in chap if c.get("src")]
+
+        title_elem = soup.select_one("h1[itemprop='name']")
+        title = title_elem.get_text(strip=True) if title_elem else ""
+
+        next_elem = soup.select_one(".nextprev > [rel='next']")
         next_chapter = (
-            urlparse(soup.select_one(".nextprev > [rel='next']").get("href"))
-            .path.strip("/")
-            .split("/")[-1]
-            if soup.select_one(".nextprev > [rel='next']")
+            urlparse(next_elem.get("href")).path.strip("/").split("/")[-1]
+            if next_elem
             else None
         )
+
+        prev_elem = soup.select_one(".nextprev > [rel='prev']")
         prev_chapter = (
-            urlparse(soup.select_one(".nextprev > [rel='prev']").get("href"))
-            .path.strip("/")
-            .split("/")[-1]
-            if soup.select_one(".nextprev > [rel='prev']")
+            urlparse(prev_elem.get("href")).path.strip("/").split("/")[-1]
+            if prev_elem
             else None
         )
 

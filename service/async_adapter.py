@@ -1,4 +1,3 @@
-# service/async_adapter.py
 import asyncio
 from .async_scraper import AsyncScraper
 
@@ -10,12 +9,12 @@ class AsyncScraperAdapter:
     def _run_async(self, coroutine):
         """Run async coroutine in sync context"""
         try:
-            loop = asyncio.get_event_loop()
+            return asyncio.run(coroutine)
         except RuntimeError:
+            # Fallback for environments where asyncio.run might fail (e.g. existing loop)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
-        return loop.run_until_complete(coroutine)
+            return loop.run_until_complete(coroutine)
 
     def get_all_komik(self, page):
         async def wrapper():

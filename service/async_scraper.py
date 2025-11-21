@@ -7,6 +7,7 @@ from urllib.parse import quote, urlparse
 from bs4 import BeautifulSoup
 import dateparser
 from datetime import datetime
+import tempfile
 from typing import List, Dict, Any
 
 
@@ -14,7 +15,7 @@ class AsyncScraper:
     def __init__(self, base_url):
         self.base_url = base_url
         self.session = None
-        self.cache_file = "komik_types.json"
+        self.cache_file = os.path.join(tempfile.gettempdir(), "komik_types.json")
         self.type_cache = self._load_cache()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",

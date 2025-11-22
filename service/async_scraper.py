@@ -65,6 +65,30 @@ class AsyncScraper:
         normalized = re.sub(r"\s+", " ", normalized)
         return normalized.strip()
 
+    def _extract_chapter_number(self, title: str) -> str:
+        """
+        Extract chapter number only from chapter title
+        Examples:
+        - "Chronicles of the Demon Faction Chapter 156 Bahasa Indonesia" → "156"
+        - "One Piece Chapter 1050" → "1050"
+        - "Solo Leveling Chapter 45.5" → "45.5"
+        - "Tower of God Chapter 123 English" → "123"
+        """
+        if not title:
+            return ""
+
+        # Pattern khusus untuk mengambil angka setelah "Chapter"
+        match = re.search(r'Chapter\s+(\d+(?:\.\d+)?)', title, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+        # Fallback: ambil angka pertama yang ditemukan
+        match = re.search(r'(\d+(?:\.\d+)?)', title)
+        if match:
+            return match.group(1)
+
+        return ""
+
     async def scrape(self, url=None):
         target_url = url if url else self.base_url
         async with self.session.get(target_url) as response:
@@ -109,7 +133,6 @@ class AsyncScraper:
         if slugs_to_fetch:
             tasks = [self.get_komik_type_from_detail(slug) for slug in slugs_to_fetch]
             await asyncio.gather(*tasks, return_exceptions=True)
-            # Cache is updated in get_komik_type_from_detail
 
         return {slug: self.type_cache.get(slug, "Unknown") for slug in slugs}
 
@@ -248,16 +271,11 @@ class AsyncScraper:
             latest_release_data.append(komik_data)
 
         if slugs:
-            # Fetch types for current slugs
             type_mapping = await self.get_komik_types_batch(slugs)
             for komik in latest_release_data:
                 if komik["slug"] and komik["slug"] in type_mapping:
                     komik["type"] = type_mapping[komik["slug"]]
 
-            # PRUNE CACHE: Keep only slugs that are in the current latest list
-            # Note: This is aggressive. It means if you visit 'get_all_komik', those types are cached,
-            # but if you then visit 'get_latest_komik', they are wiped if not in latest.
-            # Based on user request "yg sudah tidak ada di latest update... dihapus judulnya", this is correct.
             self.type_cache = {k: v for k, v in self.type_cache.items() if k in slugs}
             self._save_cache()
 
@@ -382,13 +400,13 @@ class AsyncScraper:
         chap = soup.select(".main-reading-area img")
 
         komik_link = soup.select_one(".allc a")
+        komik_title = soup.select_one(".allc a").get_text(strip=True) if komik_link else None
         komik_slug = komik_link.get("href").rstrip("/").split("/")[-1] if komik_link else None
 
         images = [c.get("src") for c in chap if c.get("src")]
 
-        title_elem = soup.select_one("h1[itemprop='name']")
-        title = title_elem.get_text(strip=True) if title_elem else ""
-
+        title_chapter = soup.select_one("h1[itemprop='name']").get_text(strip=True) if soup.select_one("h1[itemprop='name']") else ""
+        chapter_number = self._extract_chapter_number(title_chapter)
         next_elem = soup.select_one(".nextprev > [rel='next']")
         next_chapter = (
             urlparse(next_elem.get("href")).path.strip("/").split("/")[-1]
@@ -404,7 +422,8 @@ class AsyncScraper:
         )
 
         return {
-            "title": title,
+            "title": komik_title,
+            "chapter_number": chapter_number,
             "komik_slug": komik_slug,
             "next_chapter_slug": next_chapter,
             "previous_chapter_slug": prev_chapter,

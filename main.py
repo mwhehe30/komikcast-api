@@ -224,13 +224,3 @@ async def chapter_detail(slug: str, chapter: int):
     raw = await fetch(url)
 
     return clean(raw)
-
-
-# ====================================
-# SHUTDOWN CLEANUP
-# ====================================
-
-@app.lifespan("shutdown")
-async def shutdown_event():
-
-    await client.aclose()

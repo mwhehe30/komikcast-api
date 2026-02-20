@@ -2,40 +2,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from typing import Any, List, Dict, Set
-from contextlib import asynccontextmanager
+
+app = FastAPI()
 
 
 # ====================================
-# LIFESPAN
-# ====================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-
-    # startup
-    app.state.client = httpx.AsyncClient(
-        headers={
-            "accept": "application/json, text/plain, */*",
-            "referer": "https://v1.komikcast.fit/",
-        },
-        timeout=30.0
-    )
-
-    print("HTTP Client started")
-
-    yield
-
-    # shutdown
-    await app.state.client.aclose()
-
-    print("HTTP Client closed")
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-# ====================================
-# CORS
+# PUBLIC CORS
 # ====================================
 
 app.add_middleware(
@@ -47,15 +19,30 @@ app.add_middleware(
 )
 
 
+# ====================================
+# CONFIG
+# ====================================
+
 BASE = "https://be.komikcast.cc"
+
+HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "referer": "https://v1.komikcast.fit/",
+}
+
+client = httpx.AsyncClient(
+    headers=HEADERS,
+    timeout=30.0,
+)
+
 SOURCE_PAGE_SIZE = 20
 
 
 # ====================================
-# CLEAN
+# CLEAN FUNCTION
 # ====================================
 
-def clean(obj: Any):
+def clean(obj: Any) -> Any:
 
     if isinstance(obj, dict):
 
@@ -63,7 +50,10 @@ def clean(obj: Any):
 
         for k, v in obj.items():
 
-            if v is None or v == "":
+            if v is None:
+                continue
+
+            if v == "":
                 continue
 
             result[k] = clean(v)
@@ -78,14 +68,12 @@ def clean(obj: Any):
 
 
 # ====================================
-# FETCH
+# FETCH FUNCTION
 # ====================================
 
-async def fetch(app: FastAPI, url: str):
+async def fetch(url: str) -> Dict:
 
     try:
-
-        client: httpx.AsyncClient = app.state.client
 
         r = await client.get(url)
 
@@ -93,7 +81,7 @@ async def fetch(app: FastAPI, url: str):
 
             raise HTTPException(
                 status_code=r.status_code,
-                detail="Source error"
+                detail="Source API error"
             )
 
         return r.json()
@@ -107,7 +95,20 @@ async def fetch(app: FastAPI, url: str):
 
 
 # ====================================
-# SERIES OFFSET PAGINATION
+# ROOT
+# ====================================
+
+@app.get("/")
+async def root():
+
+    return {
+        "status": 200,
+        "message": "Komikcast API with OFFSET pagination (ANTI DUPLICATE)"
+    }
+
+
+# ====================================
+# SERIES LIST (OFFSET + TAKE)
 # ====================================
 
 @app.get("/series")
@@ -120,6 +121,8 @@ async def series(
     start_index = offset % SOURCE_PAGE_SIZE
 
     results: List[Dict] = []
+
+    # anti duplicate tracker
     seen: Set[str] = set()
 
     page = start_page
@@ -134,7 +137,7 @@ async def series(
             f"&page={page}"
         )
 
-        raw = await fetch(app, url)
+        raw = await fetch(url)
 
         cleaned = clean(raw)
 
@@ -143,6 +146,7 @@ async def series(
         if not items:
             break
 
+        # apply local offset slicing
         if page == start_page:
             items = items[start_index:]
 
@@ -150,7 +154,11 @@ async def series(
 
             slug = item.get("slug")
 
-            if not slug or slug in seen:
+            # skip duplicate
+            if not slug:
+                continue
+
+            if slug in seen:
                 continue
 
             seen.add(slug)
@@ -162,6 +170,10 @@ async def series(
 
         page += 1
 
+        if page > 1000:
+            break
+
+
     return {
         "status": 200,
         "offset": offset,
@@ -170,3 +182,55 @@ async def series(
         "hasMore": len(results) == take,
         "data": results
     }
+
+
+# ====================================
+# SERIES DETAIL
+# ====================================
+
+@app.get("/series/{slug}")
+async def series_detail(slug: str):
+
+    url = f"{BASE}/series/{slug}"
+
+    raw = await fetch(url)
+
+    return clean(raw)
+
+
+# ====================================
+# CHAPTER LIST
+# ====================================
+
+@app.get("/series/{slug}/chapters")
+async def chapters(slug: str):
+
+    url = f"{BASE}/series/{slug}/chapters"
+
+    raw = await fetch(url)
+
+    return clean(raw)
+
+
+# ====================================
+# CHAPTER DETAIL
+# ====================================
+
+@app.get("/series/{slug}/chapters/{chapter}")
+async def chapter_detail(slug: str, chapter: int):
+
+    url = f"{BASE}/series/{slug}/chapters/{chapter}"
+
+    raw = await fetch(url)
+
+    return clean(raw)
+
+
+# ====================================
+# SHUTDOWN CLEANUP
+# ====================================
+
+@app.lifespan("shutdown")
+async def shutdown_event():
+
+    await client.aclose()

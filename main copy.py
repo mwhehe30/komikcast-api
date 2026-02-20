@@ -1,17 +1,17 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Any, Optional
+from typing import Any
 
 app = FastAPI()
 
 # ====================================
-# ENABLE PUBLIC CORS
+# ENABLE CORS (PUBLIC ACCESS)
 # ====================================
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # allow all domains
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,12 +28,7 @@ HEADERS = {
     "Referer": "https://v1.komikcast.fit/"
 }
 
-client = httpx.AsyncClient(
-    headers=HEADERS,
-    timeout=30.0
-)
-
-PAGE_SIZE = 20  # size dari backend sumber
+client = httpx.AsyncClient(headers=HEADERS)
 
 
 # ====================================
@@ -93,7 +88,7 @@ async def fetch(url: str):
 
 
 # ====================================
-# ROOT
+# ROUTES
 # ====================================
 
 @app.get("/")
@@ -101,92 +96,31 @@ async def root():
 
     return {
         "status": "ok",
-        "message": "Komikcast Cursor API running"
+        "message": "Komik API running"
     }
 
 
-# ====================================
-# CURSOR PAGINATION SERIES
-# ====================================
-
+# SERIES LIST
 @app.get("/series")
 async def series(
-    cursor: Optional[int] = Query(None),
-    take: int = Query(20, ge=1, le=100)
+    page: int = Query(1),
+    take: int = Query(20)
 ):
-    """
-    Cursor pagination endpoint
 
-    Example:
+    url = (
+        f"{BASE}/series"
+        f"?preset=rilisan_terbaru"
+        f"&take={take}"
+        f"&takeChapter=3"
+        f"&page={page}"
+    )
 
-    /series?take=20
-    /series?cursor=9680&take=20
-    """
+    raw = await fetch(url)
 
-    page = 1
-    results = []
-
-    while len(results) < take:
-
-        url = (
-            f"{BASE}/series"
-            f"?preset=rilisan_terbaru"
-            f"&take={PAGE_SIZE}"
-            f"&takeChapter=3"
-            f"&page={page}"
-        )
-
-        raw = await fetch(url)
-
-        cleaned = clean(raw)
-
-        items = cleaned.get("data", [])
-
-        if not items:
-            break
-
-        for item in items:
-
-            item_id = item.get("id")
-
-            if item_id is None:
-                continue
-
-            # skip sampai lewat cursor
-            if cursor is not None and item_id >= cursor:
-                continue
-
-            results.append(item)
-
-            if len(results) >= take:
-                break
-
-        page += 1
-
-        # safety stop
-        if page > 1000:
-            break
-
-    # next cursor
-    next_cursor = None
-    if results:
-        next_cursor = results[-1]["id"]
-
-    return {
-        "status": 200,
-        "cursor": cursor,
-        "nextCursor": next_cursor,
-        "take": take,
-        "count": len(results),
-        "hasMore": len(results) == take,
-        "data": results
-    }
+    return clean(raw)
 
 
-# ====================================
 # SERIES DETAIL
-# ====================================
-
 @app.get("/series/{slug}")
 async def series_detail(slug: str):
 
@@ -197,10 +131,7 @@ async def series_detail(slug: str):
     return clean(raw)
 
 
-# ====================================
 # CHAPTER LIST
-# ====================================
-
 @app.get("/series/{slug}/chapters")
 async def chapters(slug: str):
 
@@ -211,10 +142,7 @@ async def chapters(slug: str):
     return clean(raw)
 
 
-# ====================================
 # CHAPTER DETAIL
-# ====================================
-
 @app.get("/series/{slug}/chapters/{chapter}")
 async def chapter_detail(slug: str, chapter: int):
 

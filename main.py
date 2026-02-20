@@ -1,11 +1,25 @@
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from typing import Any
 
-app = FastAPI(
-    title="Komik API",
-    version="1.0.0"
+app = FastAPI()
+
+# ====================================
+# ENABLE CORS (PUBLIC ACCESS)
+# ====================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # allow all domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+# ====================================
+# CONFIG
+# ====================================
 
 BASE = "https://be.komikcast.cc"
 
@@ -14,14 +28,12 @@ HEADERS = {
     "Referer": "https://v1.komikcast.fit/"
 }
 
-client = httpx.AsyncClient(
-    headers=HEADERS,
-    timeout=30
-)
+client = httpx.AsyncClient(headers=HEADERS)
 
-# =====================================================
-# CLEAN FUNCTION (remove null, "", empty object)
-# =====================================================
+
+# ====================================
+# CLEAN FUNCTION
+# ====================================
 
 def clean(obj: Any):
 
@@ -37,30 +49,20 @@ def clean(obj: Any):
             if v == "":
                 continue
 
-            if v == {}:
-                continue
-
-            if v == []:
-                continue
-
             result[k] = clean(v)
 
         return result
 
     elif isinstance(obj, list):
 
-        return [
-            clean(x)
-            for x in obj
-            if x is not None and x != "" and x != {}
-        ]
+        return [clean(x) for x in obj]
 
     return obj
 
 
-# =====================================================
+# ====================================
 # FETCH FUNCTION
-# =====================================================
+# ====================================
 
 async def fetch(url: str):
 
@@ -69,6 +71,7 @@ async def fetch(url: str):
         r = await client.get(url)
 
         if r.status_code != 200:
+
             raise HTTPException(
                 status_code=r.status_code,
                 detail="Source error"
@@ -84,148 +87,20 @@ async def fetch(url: str):
         )
 
 
-# =====================================================
-# TRANSFORM SERIES LIST (infinite scroll)
-# =====================================================
-
-def transform_series_list(raw):
-
-    result = []
-
-    for item in raw["data"]:
-
-        d = item["data"]
-
-        result.append(clean({
-
-            "id": item["id"],
-
-            "title": d.get("title"),
-
-            "slug": d.get("slug"),
-
-            "cover": d.get("coverImage"),
-
-            "rating": d.get("rating"),
-
-            "status": d.get("status"),
-
-            "type": d.get("type"),
-
-            "views": item["dataMetadata"]["totalViewsComputed"]
-
-        }))
-
-    return result
-
-
-# =====================================================
-# TRANSFORM SERIES DETAIL
-# =====================================================
-
-def transform_series_detail(raw):
-
-    d = raw["data"]
-    meta = d["data"]
-
-    return clean({
-
-        "id": d["id"],
-
-        "title": meta.get("title"),
-
-        "slug": meta.get("slug"),
-
-        "cover": meta.get("coverImage"),
-
-        "background": meta.get("backgroundImage"),
-
-        "rating": meta.get("rating"),
-
-        "status": meta.get("status"),
-
-        "author": meta.get("author"),
-
-        "format": meta.get("format"),
-
-        "synopsis": meta.get("synopsis"),
-
-        "genres": [
-            g["data"]["name"]
-            for g in meta.get("genres", [])
-        ],
-
-        "views": d["dataMetadata"]["totalViewsComputed"]
-
-    })
-
-
-# =====================================================
-# TRANSFORM CHAPTER LIST
-# =====================================================
-
-def transform_chapters(raw):
-
-    result = []
-
-    for ch in raw["data"]:
-
-        meta = ch["data"]
-
-        result.append(clean({
-
-            "id": ch["id"],
-
-            "chapter": meta.get("index"),
-
-            "views": ch["views"]["total"],
-
-            "createdAt": ch["createdAt"]
-
-        }))
-
-    return result
-
-
-# =====================================================
-# TRANSFORM CHAPTER DETAIL (IMAGES)
-# =====================================================
-
-def transform_chapter_detail(raw):
-
-    d = raw["data"]
-    meta = d["data"]
-
-    return clean({
-
-        "id": d["id"],
-
-        "chapter": meta.get("index"),
-
-        "images": meta.get("images"),
-
-        "views": d["views"]["total"],
-
-        "createdAt": d["createdAt"]
-
-    })
-
-
-# =====================================================
+# ====================================
 # ROUTES
-# =====================================================
+# ====================================
 
-
-# Health
 @app.get("/")
 async def root():
 
     return {
-        "status": "ok"
+        "status": "ok",
+        "message": "Komik API running"
     }
 
 
-# Infinite scroll series
+# SERIES LIST
 @app.get("/series")
 async def series(
     page: int = Query(1),
@@ -243,20 +118,10 @@ async def series(
 
     raw = await fetch(url)
 
-    return {
-
-        "status": 200,
-
-        "page": raw["meta"]["page"],
-
-        "total": raw["meta"]["total"],
-
-        "data": transform_series_list(raw)
-
-    }
+    return clean(raw)
 
 
-# Series detail
+# SERIES DETAIL
 @app.get("/series/{slug}")
 async def series_detail(slug: str):
 
@@ -264,16 +129,10 @@ async def series_detail(slug: str):
 
     raw = await fetch(url)
 
-    return {
-
-        "status": 200,
-
-        "data": transform_series_detail(raw)
-
-    }
+    return clean(raw)
 
 
-# Chapter list
+# CHAPTER LIST
 @app.get("/series/{slug}/chapters")
 async def chapters(slug: str):
 
@@ -281,16 +140,10 @@ async def chapters(slug: str):
 
     raw = await fetch(url)
 
-    return {
-
-        "status": 200,
-
-        "data": transform_chapters(raw)
-
-    }
+    return clean(raw)
 
 
-# Chapter detail (images)
+# CHAPTER DETAIL
 @app.get("/series/{slug}/chapters/{chapter}")
 async def chapter_detail(slug: str, chapter: int):
 
@@ -298,10 +151,4 @@ async def chapter_detail(slug: str, chapter: int):
 
     raw = await fetch(url)
 
-    return {
-
-        "status": 200,
-
-        "data": transform_chapter_detail(raw)
-
-    }
+    return clean(raw)

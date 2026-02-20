@@ -1,12 +1,41 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Any, Optional
+from typing import Any, List, Dict, Set
+from contextlib import asynccontextmanager
 
-app = FastAPI()
 
 # ====================================
-# ENABLE PUBLIC CORS
+# LIFESPAN
+# ====================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # startup
+    app.state.client = httpx.AsyncClient(
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "referer": "https://v1.komikcast.fit/",
+        },
+        timeout=30.0
+    )
+
+    print("HTTP Client started")
+
+    yield
+
+    # shutdown
+    await app.state.client.aclose()
+
+    print("HTTP Client closed")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ====================================
+# CORS
 # ====================================
 
 app.add_middleware(
@@ -17,27 +46,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ====================================
-# CONFIG
-# ====================================
 
 BASE = "https://be.komikcast.cc"
-
-HEADERS = {
-    "accept": "application/json, text/plain, */*",
-    "Referer": "https://v1.komikcast.fit/"
-}
-
-client = httpx.AsyncClient(
-    headers=HEADERS,
-    timeout=30.0
-)
-
-PAGE_SIZE = 20  # size dari backend sumber
+SOURCE_PAGE_SIZE = 20
 
 
 # ====================================
-# CLEAN FUNCTION
+# CLEAN
 # ====================================
 
 def clean(obj: Any):
@@ -48,10 +63,7 @@ def clean(obj: Any):
 
         for k, v in obj.items():
 
-            if v is None:
-                continue
-
-            if v == "":
+            if v is None or v == "":
                 continue
 
             result[k] = clean(v)
@@ -66,12 +78,14 @@ def clean(obj: Any):
 
 
 # ====================================
-# FETCH FUNCTION
+# FETCH
 # ====================================
 
-async def fetch(url: str):
+async def fetch(app: FastAPI, url: str):
 
     try:
+
+        client: httpx.AsyncClient = app.state.client
 
         r = await client.get(url)
 
@@ -93,50 +107,34 @@ async def fetch(url: str):
 
 
 # ====================================
-# ROOT
-# ====================================
-
-@app.get("/")
-async def root():
-
-    return {
-        "status": "ok",
-        "message": "Komikcast Cursor API running"
-    }
-
-
-# ====================================
-# CURSOR PAGINATION SERIES
+# SERIES OFFSET PAGINATION
 # ====================================
 
 @app.get("/series")
 async def series(
-    cursor: Optional[int] = Query(None),
+    offset: int = Query(0, ge=0),
     take: int = Query(20, ge=1, le=100)
 ):
-    """
-    Cursor pagination endpoint
 
-    Example:
+    start_page = (offset // SOURCE_PAGE_SIZE) + 1
+    start_index = offset % SOURCE_PAGE_SIZE
 
-    /series?take=20
-    /series?cursor=9680&take=20
-    """
+    results: List[Dict] = []
+    seen: Set[str] = set()
 
-    page = 1
-    results = []
+    page = start_page
 
     while len(results) < take:
 
         url = (
             f"{BASE}/series"
             f"?preset=rilisan_terbaru"
-            f"&take={PAGE_SIZE}"
+            f"&take={SOURCE_PAGE_SIZE}"
             f"&takeChapter=3"
             f"&page={page}"
         )
 
-        raw = await fetch(url)
+        raw = await fetch(app, url)
 
         cleaned = clean(raw)
 
@@ -145,16 +143,17 @@ async def series(
         if not items:
             break
 
+        if page == start_page:
+            items = items[start_index:]
+
         for item in items:
 
-            item_id = item.get("id")
+            slug = item.get("slug")
 
-            if item_id is None:
+            if not slug or slug in seen:
                 continue
 
-            # skip sampai lewat cursor
-            if cursor is not None and item_id >= cursor:
-                continue
+            seen.add(slug)
 
             results.append(item)
 
@@ -163,63 +162,11 @@ async def series(
 
         page += 1
 
-        # safety stop
-        if page > 1000:
-            break
-
-    # next cursor
-    next_cursor = None
-    if results:
-        next_cursor = results[-1]["id"]
-
     return {
         "status": 200,
-        "cursor": cursor,
-        "nextCursor": next_cursor,
+        "offset": offset,
         "take": take,
         "count": len(results),
         "hasMore": len(results) == take,
         "data": results
     }
-
-
-# ====================================
-# SERIES DETAIL
-# ====================================
-
-@app.get("/series/{slug}")
-async def series_detail(slug: str):
-
-    url = f"{BASE}/series/{slug}"
-
-    raw = await fetch(url)
-
-    return clean(raw)
-
-
-# ====================================
-# CHAPTER LIST
-# ====================================
-
-@app.get("/series/{slug}/chapters")
-async def chapters(slug: str):
-
-    url = f"{BASE}/series/{slug}/chapters"
-
-    raw = await fetch(url)
-
-    return clean(raw)
-
-
-# ====================================
-# CHAPTER DETAIL
-# ====================================
-
-@app.get("/series/{slug}/chapters/{chapter}")
-async def chapter_detail(slug: str, chapter: int):
-
-    url = f"{BASE}/series/{slug}/chapters/{chapter}"
-
-    raw = await fetch(url)
-
-    return clean(raw)

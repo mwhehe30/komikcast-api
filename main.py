@@ -1,12 +1,12 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Any, List, Dict, Set
+from typing import Any, List, Dict, Optional, Set
 
 app = FastAPI()
 
 # ====================================
-# ENABLE CORS
+# CORS
 # ====================================
 
 app.add_middleware(
@@ -32,7 +32,7 @@ SOURCE_PAGE_SIZE = 20
 
 
 # ====================================
-# CLEAN FUNCTION
+# CLEAN
 # ====================================
 
 def clean(obj: Any):
@@ -58,7 +58,7 @@ def clean(obj: Any):
 
 
 # ====================================
-# FETCH FUNCTION (VERCEL SAFE)
+# FETCH (VERCEL SAFE)
 # ====================================
 
 async def fetch(url: str):
@@ -98,28 +98,27 @@ async def root():
 
     return {
         "status": "ok",
-        "message": "Komik API OFFSET pagination ready"
+        "message": "Komik API Cursor Pagination Ready"
     }
 
 
 # ====================================
-# SERIES OFFSET PAGINATION
+# CURSOR PAGINATION
 # ====================================
 
 @app.get("/series")
 async def series(
-    offset: int = Query(0, ge=0),
+    cursor: Optional[str] = None,
     take: int = Query(20, ge=1, le=100)
 ):
 
-    start_page = (offset // SOURCE_PAGE_SIZE) + 1
-    start_index = offset % SOURCE_PAGE_SIZE
-
     results: List[Dict] = []
-
     seen: Set[str] = set()
 
-    page = start_page
+    found_cursor = cursor is None
+
+    page = 1
+    next_cursor = None
 
     while len(results) < take:
 
@@ -140,10 +139,6 @@ async def series(
         if not items:
             break
 
-        # apply offset slice
-        if page == start_page:
-            items = items[start_index:]
-
         for item in items:
 
             slug = item.get("slug")
@@ -151,12 +146,23 @@ async def series(
             if not slug:
                 continue
 
+            # tunggu sampai cursor ditemukan
+            if not found_cursor:
+
+                if slug == cursor:
+                    found_cursor = True
+
+                continue
+
+            # anti duplicate
             if slug in seen:
                 continue
 
             seen.add(slug)
 
             results.append(item)
+
+            next_cursor = slug
 
             if len(results) >= take:
                 break
@@ -166,12 +172,11 @@ async def series(
         if page > 1000:
             break
 
-
     return {
         "status": 200,
-        "offset": offset,
-        "take": take,
         "count": len(results),
+        "cursor": cursor,
+        "nextCursor": next_cursor,
         "hasMore": len(results) == take,
         "data": results
     }

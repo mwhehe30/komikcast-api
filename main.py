@@ -110,7 +110,6 @@ async def series(
     url = (
         f"{BASE}/series"
         f"?preset=rilisan_terbaru"
-        f"&type=project"
         f"&take={take}"
         f"&takeChapter=3"
         f"&page={page}"

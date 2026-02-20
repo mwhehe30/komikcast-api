@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Any
+from typing import Any, Optional
 
 app = FastAPI()
 
@@ -33,7 +33,7 @@ client = httpx.AsyncClient(
     timeout=30.0
 )
 
-SOURCE_PAGE_SIZE = 20
+PAGE_SIZE = 20  # size dari backend sumber
 
 
 # ====================================
@@ -100,37 +100,38 @@ async def fetch(url: str):
 async def root():
 
     return {
-        "status": 200,
-        "message": "Komikcast API with offset pagination"
+        "status": "ok",
+        "message": "Komikcast Cursor API running"
     }
 
 
 # ====================================
-# SERIES LIST (OFFSET PAGINATION)
+# CURSOR PAGINATION SERIES
 # ====================================
 
 @app.get("/series")
 async def series(
-    offset: int = Query(0, ge=0),
+    cursor: Optional[int] = Query(None),
     take: int = Query(20, ge=1, le=100)
 ):
+    """
+    Cursor pagination endpoint
 
-    # hitung page awal
-    start_page = (offset // SOURCE_PAGE_SIZE) + 1
+    Example:
 
-    # index mulai di page tersebut
-    start_index = offset % SOURCE_PAGE_SIZE
+    /series?take=20
+    /series?cursor=9680&take=20
+    """
 
+    page = 1
     results = []
-
-    page = start_page
 
     while len(results) < take:
 
         url = (
             f"{BASE}/series"
             f"?preset=rilisan_terbaru"
-            f"&take={SOURCE_PAGE_SIZE}"
+            f"&take={PAGE_SIZE}"
             f"&takeChapter=3"
             f"&page={page}"
         )
@@ -144,23 +145,37 @@ async def series(
         if not items:
             break
 
-        # slice sesuai offset lokal
-        if page == start_page:
-            items = items[start_index:]
+        for item in items:
 
-        results.extend(items)
+            item_id = item.get("id")
+
+            if item_id is None:
+                continue
+
+            # skip sampai lewat cursor
+            if cursor is not None and item_id >= cursor:
+                continue
+
+            results.append(item)
+
+            if len(results) >= take:
+                break
 
         page += 1
 
+        # safety stop
         if page > 1000:
             break
 
-    # potong sesuai take
-    results = results[:take]
+    # next cursor
+    next_cursor = None
+    if results:
+        next_cursor = results[-1]["id"]
 
     return {
         "status": 200,
-        "offset": offset,
+        "cursor": cursor,
+        "nextCursor": next_cursor,
         "take": take,
         "count": len(results),
         "hasMore": len(results) == take,
@@ -208,10 +223,3 @@ async def chapter_detail(slug: str, chapter: int):
     raw = await fetch(url)
 
     return clean(raw)
-
-
-# ====================================
-# SHUTDOWN CLEANUP
-# ====================================
-
-

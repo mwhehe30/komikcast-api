@@ -5,9 +5,8 @@ from typing import Any, List, Dict, Set
 
 app = FastAPI()
 
-
 # ====================================
-# PUBLIC CORS
+# ENABLE CORS
 # ====================================
 
 app.add_middleware(
@@ -17,7 +16,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ====================================
 # CONFIG
@@ -30,11 +28,6 @@ HEADERS = {
     "referer": "https://v1.komikcast.fit/",
 }
 
-client = httpx.AsyncClient(
-    headers=HEADERS,
-    timeout=30.0,
-)
-
 SOURCE_PAGE_SIZE = 20
 
 
@@ -42,7 +35,7 @@ SOURCE_PAGE_SIZE = 20
 # CLEAN FUNCTION
 # ====================================
 
-def clean(obj: Any) -> Any:
+def clean(obj: Any):
 
     if isinstance(obj, dict):
 
@@ -50,10 +43,7 @@ def clean(obj: Any) -> Any:
 
         for k, v in obj.items():
 
-            if v is None:
-                continue
-
-            if v == "":
+            if v is None or v == "":
                 continue
 
             result[k] = clean(v)
@@ -68,23 +58,28 @@ def clean(obj: Any) -> Any:
 
 
 # ====================================
-# FETCH FUNCTION
+# FETCH FUNCTION (VERCEL SAFE)
 # ====================================
 
-async def fetch(url: str) -> Dict:
+async def fetch(url: str):
 
     try:
 
-        r = await client.get(url)
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            timeout=30.0
+        ) as client:
 
-        if r.status_code != 200:
+            r = await client.get(url)
 
-            raise HTTPException(
-                status_code=r.status_code,
-                detail="Source API error"
-            )
+            if r.status_code != 200:
 
-        return r.json()
+                raise HTTPException(
+                    status_code=r.status_code,
+                    detail="Source error"
+                )
+
+            return r.json()
 
     except httpx.RequestError:
 
@@ -102,13 +97,13 @@ async def fetch(url: str) -> Dict:
 async def root():
 
     return {
-        "status": 200,
-        "message": "Komikcast API with OFFSET pagination (ANTI DUPLICATE)"
+        "status": "ok",
+        "message": "Komik API OFFSET pagination ready"
     }
 
 
 # ====================================
-# SERIES LIST (OFFSET + TAKE)
+# SERIES OFFSET PAGINATION
 # ====================================
 
 @app.get("/series")
@@ -122,7 +117,6 @@ async def series(
 
     results: List[Dict] = []
 
-    # anti duplicate tracker
     seen: Set[str] = set()
 
     page = start_page
@@ -146,7 +140,7 @@ async def series(
         if not items:
             break
 
-        # apply local offset slicing
+        # apply offset slice
         if page == start_page:
             items = items[start_index:]
 
@@ -154,7 +148,6 @@ async def series(
 
             slug = item.get("slug")
 
-            # skip duplicate
             if not slug:
                 continue
 
@@ -191,9 +184,7 @@ async def series(
 @app.get("/series/{slug}")
 async def series_detail(slug: str):
 
-    url = f"{BASE}/series/{slug}"
-
-    raw = await fetch(url)
+    raw = await fetch(f"{BASE}/series/{slug}")
 
     return clean(raw)
 
@@ -205,9 +196,7 @@ async def series_detail(slug: str):
 @app.get("/series/{slug}/chapters")
 async def chapters(slug: str):
 
-    url = f"{BASE}/series/{slug}/chapters"
-
-    raw = await fetch(url)
+    raw = await fetch(f"{BASE}/series/{slug}/chapters")
 
     return clean(raw)
 
@@ -219,8 +208,6 @@ async def chapters(slug: str):
 @app.get("/series/{slug}/chapters/{chapter}")
 async def chapter_detail(slug: str, chapter: int):
 
-    url = f"{BASE}/series/{slug}/chapters/{chapter}"
-
-    raw = await fetch(url)
+    raw = await fetch(f"{BASE}/series/{slug}/chapters/{chapter}")
 
     return clean(raw)

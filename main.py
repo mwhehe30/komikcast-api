@@ -1,12 +1,12 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Any, List, Dict, Optional, Set
+from typing import Any, Optional
 
 app = FastAPI()
 
 # ====================================
-# CORS
+# ENABLE PUBLIC CORS
 # ====================================
 
 app.add_middleware(
@@ -25,14 +25,19 @@ BASE = "https://be.komikcast.cc"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
-    "referer": "https://v1.komikcast.fit/",
+    "Referer": "https://v1.komikcast.fit/"
 }
 
-SOURCE_PAGE_SIZE = 20
+client = httpx.AsyncClient(
+    headers=HEADERS,
+    timeout=30.0
+)
+
+PAGE_SIZE = 20  # size dari backend sumber
 
 
 # ====================================
-# CLEAN
+# CLEAN FUNCTION
 # ====================================
 
 def clean(obj: Any):
@@ -43,7 +48,10 @@ def clean(obj: Any):
 
         for k, v in obj.items():
 
-            if v is None or v == "":
+            if v is None:
+                continue
+
+            if v == "":
                 continue
 
             result[k] = clean(v)
@@ -58,28 +66,23 @@ def clean(obj: Any):
 
 
 # ====================================
-# FETCH (VERCEL SAFE)
+# FETCH FUNCTION
 # ====================================
 
 async def fetch(url: str):
 
     try:
 
-        async with httpx.AsyncClient(
-            headers=HEADERS,
-            timeout=30.0
-        ) as client:
+        r = await client.get(url)
 
-            r = await client.get(url)
+        if r.status_code != 200:
 
-            if r.status_code != 200:
+            raise HTTPException(
+                status_code=r.status_code,
+                detail="Source error"
+            )
 
-                raise HTTPException(
-                    status_code=r.status_code,
-                    detail="Source error"
-                )
-
-            return r.json()
+        return r.json()
 
     except httpx.RequestError:
 
@@ -98,34 +101,37 @@ async def root():
 
     return {
         "status": "ok",
-        "message": "Komik API Cursor Pagination Ready"
+        "message": "Komikcast Cursor API running"
     }
 
 
 # ====================================
-# CURSOR PAGINATION
+# CURSOR PAGINATION SERIES
 # ====================================
 
 @app.get("/series")
 async def series(
-    cursor: Optional[str] = None,
+    cursor: Optional[int] = Query(None),
     take: int = Query(20, ge=1, le=100)
 ):
+    """
+    Cursor pagination endpoint
 
-    results: List[Dict] = []
-    seen: Set[str] = set()
+    Example:
 
-    found_cursor = cursor is None
+    /series?take=20
+    /series?cursor=9680&take=20
+    """
 
     page = 1
-    next_cursor = None
+    results = []
 
     while len(results) < take:
 
         url = (
             f"{BASE}/series"
             f"?preset=rilisan_terbaru"
-            f"&take={SOURCE_PAGE_SIZE}"
+            f"&take={PAGE_SIZE}"
             f"&takeChapter=3"
             f"&page={page}"
         )
@@ -141,42 +147,37 @@ async def series(
 
         for item in items:
 
-            slug = item.get("slug")
+            item_id = item.get("id")
 
-            if not slug:
+            if item_id is None:
                 continue
 
-            # tunggu sampai cursor ditemukan
-            if not found_cursor:
-
-                if slug == cursor:
-                    found_cursor = True
-
+            # skip sampai lewat cursor
+            if cursor is not None and item_id >= cursor:
                 continue
-
-            # anti duplicate
-            if slug in seen:
-                continue
-
-            seen.add(slug)
 
             results.append(item)
-
-            next_cursor = slug
 
             if len(results) >= take:
                 break
 
         page += 1
 
+        # safety stop
         if page > 1000:
             break
 
+    # next cursor
+    next_cursor = None
+    if results:
+        next_cursor = results[-1]["id"]
+
     return {
         "status": 200,
-        "count": len(results),
         "cursor": cursor,
         "nextCursor": next_cursor,
+        "take": take,
+        "count": len(results),
         "hasMore": len(results) == take,
         "data": results
     }
@@ -189,7 +190,9 @@ async def series(
 @app.get("/series/{slug}")
 async def series_detail(slug: str):
 
-    raw = await fetch(f"{BASE}/series/{slug}")
+    url = f"{BASE}/series/{slug}"
+
+    raw = await fetch(url)
 
     return clean(raw)
 
@@ -201,7 +204,9 @@ async def series_detail(slug: str):
 @app.get("/series/{slug}/chapters")
 async def chapters(slug: str):
 
-    raw = await fetch(f"{BASE}/series/{slug}/chapters")
+    url = f"{BASE}/series/{slug}/chapters"
+
+    raw = await fetch(url)
 
     return clean(raw)
 
@@ -213,6 +218,8 @@ async def chapters(slug: str):
 @app.get("/series/{slug}/chapters/{chapter}")
 async def chapter_detail(slug: str, chapter: int):
 
-    raw = await fetch(f"{BASE}/series/{slug}/chapters/{chapter}")
+    url = f"{BASE}/series/{slug}/chapters/{chapter}"
+
+    raw = await fetch(url)
 
     return clean(raw)

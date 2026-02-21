@@ -1,17 +1,9 @@
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Any, Dict
-import asyncio
+from typing import Any
 
-# ====================================
-# APP INIT
-# ====================================
-
-app = FastAPI(
-    title="Komikcast API",
-    version="2.0.0"
-)
+app = FastAPI()
 
 # ====================================
 # ENABLE PUBLIC CORS
@@ -33,43 +25,15 @@ BASE = "https://be.komikcast.cc"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
-    "Referer": "https://v1.komikcast.fit/",
-    "User-Agent": "Mozilla/5.0"
+    "Referer": "https://v1.komikcast.fit/"
 }
 
-SOURCE_PAGE_SIZE = 20
-
-LIMITS = httpx.Limits(
-    max_connections=100,
-    max_keepalive_connections=20
+client = httpx.AsyncClient(
+    headers=HEADERS,
+    timeout=30.0
 )
 
-TIMEOUT = httpx.Timeout(30.0)
-
-client: httpx.AsyncClient = None
-
-
-# ====================================
-# STARTUP / SHUTDOWN
-# ====================================
-
-@app.on_event("startup")
-async def startup():
-
-    global client
-
-    client = httpx.AsyncClient(
-        headers=HEADERS,
-        timeout=TIMEOUT,
-        limits=LIMITS,
-        http2=True
-    )
-
-
-@app.on_event("shutdown")
-async def shutdown():
-
-    await client.aclose()
+SOURCE_PAGE_SIZE = 20
 
 
 # ====================================
@@ -102,37 +66,30 @@ def clean(obj: Any):
 
 
 # ====================================
-# FETCH FUNCTION WITH RETRY
+# FETCH FUNCTION
 # ====================================
 
-async def fetch(url: str) -> Dict:
+async def fetch(url: str):
 
-    retries = 3
+    try:
 
-    for attempt in range(retries):
+        r = await client.get(url)
 
-        try:
-
-            r = await client.get(url)
-
-            if r.status_code == 200:
-                return r.json()
+        if r.status_code != 200:
 
             raise HTTPException(
                 status_code=r.status_code,
                 detail="Source error"
             )
 
-        except httpx.RequestError:
+        return r.json()
 
-            if attempt == retries - 1:
+    except httpx.RequestError:
 
-                raise HTTPException(
-                    status_code=500,
-                    detail="Network error"
-                )
-
-            await asyncio.sleep(0.5)
+        raise HTTPException(
+            status_code=500,
+            detail="Network error"
+        )
 
 
 # ====================================
@@ -158,8 +115,10 @@ async def series(
     take: int = Query(20, ge=1, le=100)
 ):
 
+    # hitung page awal
     start_page = (offset // SOURCE_PAGE_SIZE) + 1
 
+    # index mulai di page tersebut
     start_index = offset % SOURCE_PAGE_SIZE
 
     results = []
@@ -185,6 +144,7 @@ async def series(
         if not items:
             break
 
+        # slice sesuai offset lokal
         if page == start_page:
             items = items[start_index:]
 
@@ -195,6 +155,7 @@ async def series(
         if page > 1000:
             break
 
+    # potong sesuai take
     results = results[:take]
 
     return {
@@ -212,9 +173,7 @@ async def series(
 # ====================================
 
 @app.get("/series/{slug}")
-async def series_detail(
-    slug: str = Path(...)
-):
+async def series_detail(slug: str):
 
     url = f"{BASE}/series/{slug}"
 
@@ -228,9 +187,7 @@ async def series_detail(
 # ====================================
 
 @app.get("/series/{slug}/chapters")
-async def chapters(
-    slug: str = Path(...)
-):
+async def chapters(slug: str):
 
     url = f"{BASE}/series/{slug}/chapters"
 
@@ -240,17 +197,21 @@ async def chapters(
 
 
 # ====================================
-# CHAPTER DETAIL (SUPPORT 5, 5.1, etc)
+# CHAPTER DETAIL
 # ====================================
 
 @app.get("/series/{slug}/chapters/{chapter}")
-async def chapter_detail(
-    slug: str,
-    chapter: str
-):
+async def chapter_detail(slug: str, chapter: int):
 
     url = f"{BASE}/series/{slug}/chapters/{chapter}"
 
     raw = await fetch(url)
 
     return clean(raw)
+
+
+# ====================================
+# SHUTDOWN CLEANUP
+# ====================================
+
+

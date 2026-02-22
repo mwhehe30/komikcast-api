@@ -333,31 +333,37 @@ async def proxy_image(
     # Set referer default
     if not referer:
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(url)
             referer = f"{parsed.scheme}://{parsed.netloc}/"
         except:
-            referer = "https://v1.komikcast.fit/"
+            referer = "https://komikcast.site/"
     
     # Fetch gambar dengan header yang sesuai
     try:
-        from fastapi.responses import StreamingResponse
-        
-        async with httpx.AsyncClient(timeout=30.0) as proxy_client:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as proxy_client:
             response = await proxy_client.get(
                 url,
                 headers={
                     "Referer": referer,
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
                     "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Sec-Fetch-Dest": "image",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "cross-site",
                 },
-                follow_redirects=True
             )
             
             if response.status_code != 200:
+                # Log error untuk debugging
+                error_detail = f"Status {response.status_code}"
+                if response.status_code == 403:
+                    error_detail = f"403 Forbidden - URL: {url[:100]}, Referer: {referer}"
                 raise HTTPException(
                     status_code=response.status_code,
-                    detail="Failed to fetch image"
+                    detail=error_detail
                 )
             
             # Stream response

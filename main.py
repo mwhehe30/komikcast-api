@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 app = FastAPI()
 
@@ -36,6 +36,57 @@ client = httpx.AsyncClient(
 )
 
 SOURCE_PAGE_SIZE = 20
+
+
+# ====================================
+# PROXY URL HELPER
+# ====================================
+
+def get_base_url(request: Request) -> str:
+    """Get base URL dari request untuk generate proxy URL"""
+    return str(request.base_url).rstrip("/")
+
+
+def proxify_url(image_url: str, base_url: str) -> str:
+    """Convert image URL ke proxy URL"""
+    if not image_url or not isinstance(image_url, str):
+        return image_url
+    
+    # Cek apakah URL gambar (common image domains/extensions)
+    if any(domain in image_url.lower() for domain in ["imgkc", "komikcast", "cdn", "minio"]) or \
+       any(image_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]):
+        return f"{base_url}/proxy?url={quote(image_url)}"
+    
+    return image_url
+
+
+def proxify_images(obj: Any, base_url: str):
+    """Recursively convert semua image URL ke proxy URL"""
+    
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            # Keys yang contain image URLs (termasuk coverImage, backgroundImage, dataImages)
+            if k in ["image", "images", "thumbnail", "cover", "poster", "avatar", "photo", "picture", "img", "src",
+                     "coverImage", "backgroundImage", "dataImages"]:
+                if isinstance(v, str):
+                    result[k] = proxify_url(v, base_url)
+                elif isinstance(v, list):
+                    result[k] = [proxify_url(item, base_url) if isinstance(item, str) else proxify_images(item, base_url) for item in v]
+                elif isinstance(v, dict):
+                    # Handle dataImages yang berupa object dengan key numerik
+                    result[k] = {key: proxify_url(val, base_url) if isinstance(val, str) else proxify_images(val, base_url) 
+                                for key, val in v.items()}
+                else:
+                    result[k] = proxify_images(v, base_url)
+            else:
+                result[k] = proxify_images(v, base_url)
+        return result
+    
+    elif isinstance(obj, list):
+        return [proxify_images(item, base_url) for item in obj]
+    
+    return obj
 
 
 # ====================================
@@ -113,6 +164,7 @@ async def root():
 
 @app.get("/series")
 async def series(
+    request: Request,
     offset: int = Query(0, ge=0),
     take: int = Query(20, ge=1, le=100)
 ):
@@ -159,6 +211,10 @@ async def series(
 
     # potong sesuai take
     results = results[:take]
+    
+    # Proxify semua image URLs
+    base_url = get_base_url(request)
+    results = proxify_images(results, base_url)
 
     return {
         "status": 200,
@@ -175,13 +231,19 @@ async def series(
 # ====================================
 
 @app.get("/series/{slug}")
-async def series_detail(slug: str):
+async def series_detail(request: Request, slug: str):
 
     url = f"{BASE}/series/{slug}"
 
     raw = await fetch(url)
+    
+    cleaned = clean(raw)
+    
+    # Proxify semua image URLs
+    base_url = get_base_url(request)
+    cleaned = proxify_images(cleaned, base_url)
 
-    return clean(raw)
+    return cleaned
 
 
 # ====================================
@@ -189,13 +251,19 @@ async def series_detail(slug: str):
 # ====================================
 
 @app.get("/series/{slug}/chapters")
-async def chapters(slug: str):
+async def chapters(request: Request, slug: str):
 
     url = f"{BASE}/series/{slug}/chapters"
 
     raw = await fetch(url)
+    
+    cleaned = clean(raw)
+    
+    # Proxify semua image URLs
+    base_url = get_base_url(request)
+    cleaned = proxify_images(cleaned, base_url)
 
-    return clean(raw)
+    return cleaned
 
 
 # ====================================
@@ -203,13 +271,19 @@ async def chapters(slug: str):
 # ====================================
 
 @app.get("/series/{slug}/chapters/{chapter}")
-async def chapter_detail(slug: str, chapter: str):
+async def chapter_detail(request: Request, slug: str, chapter: str):
 
     url = f"{BASE}/series/{slug}/chapters/{chapter}"
 
     raw = await fetch(url)
+    
+    cleaned = clean(raw)
+    
+    # Proxify semua image URLs
+    base_url = get_base_url(request)
+    cleaned = proxify_images(cleaned, base_url)
 
-    return clean(raw)
+    return cleaned
 
 
 # ====================================

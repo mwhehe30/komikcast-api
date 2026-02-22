@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import httpx
 from typing import Any
+from urllib.parse import urlparse
 
 app = FastAPI()
 
@@ -208,6 +210,96 @@ async def chapter_detail(slug: str, chapter: str):
     raw = await fetch(url)
 
     return clean(raw)
+
+
+# ====================================
+# IMAGE PROXY
+# ====================================
+
+@app.get("/proxy")
+async def proxy_image(
+    url: str = Query(..., description="Image URL to proxy"),
+    referer: str = Query(None, description="Custom referer header")
+):
+    """
+    Proxy endpoint untuk bypass 403 error pada gambar.
+    Menambahkan header Referer dan User-Agent yang sesuai.
+    """
+    
+    # Validasi URL
+    if not url:
+        raise HTTPException(status_code=400, detail="URL parameter required")
+    
+    # Validasi URL aman (block localhost/private IP)
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        hostname = parsed.hostname.lower() if parsed.hostname else ""
+        
+        # Block private addresses
+        private_patterns = [
+            "127.", "10.", "172.16.", "172.17.", "172.18.", "172.19.",
+            "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+            "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+            "192.168.", "169.254.", "localhost", "0."
+        ]
+        
+        if any(hostname.startswith(p) for p in private_patterns):
+            raise HTTPException(
+                status_code=400,
+                detail="Access to internal networks is prohibited"
+            )
+        
+        if parsed.scheme not in ["http", "https"]:
+            raise HTTPException(status_code=400, detail="Invalid URL scheme")
+            
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid URL: {str(e)}")
+    
+    # Set referer default
+    if not referer:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            referer = f"{parsed.scheme}://{parsed.netloc}/"
+        except:
+            referer = "https://v1.komikcast.fit/"
+    
+    # Fetch gambar dengan header yang sesuai
+    try:
+        from fastapi.responses import StreamingResponse
+        
+        async with httpx.AsyncClient(timeout=30.0) as proxy_client:
+            response = await proxy_client.get(
+                url,
+                headers={
+                    "Referer": referer,
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                },
+                follow_redirects=True
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to fetch image"
+                )
+            
+            # Stream response
+            return StreamingResponse(
+                iter([response.content]),
+                media_type=response.headers.get("content-type", "image/jpeg"),
+                headers={
+                    "Cache-Control": "public, max-age=86400",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
+            
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
 
 
 # ====================================

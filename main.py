@@ -5,6 +5,8 @@ import httpx
 from typing import Any
 from urllib.parse import urlparse, quote
 
+import os
+
 app = FastAPI()
 
 # ====================================
@@ -44,7 +46,22 @@ SOURCE_PAGE_SIZE = 20
 
 def get_base_url(request: Request) -> str:
     """Get base URL dari request untuk generate proxy URL"""
-    return str(request.base_url).rstrip("/")
+    # Hardcode base URL (ganti sesuai kebutuhan)
+    # return "http://unofficial-komikcast-api.vercel.app"
+    
+    base = str(request.base_url).rstrip("/")
+    
+    # Option 1: Force HTTP via environment variable
+    force_http = os.getenv("FORCE_HTTP_PROXY", "false").lower() == "true"
+    if force_http:
+        base = base.replace("https://", "http://")
+    
+    # Option 2: Use custom base URL from environment
+    custom_base = os.getenv("PROXY_BASE_URL")
+    if custom_base:
+        return custom_base.rstrip("/")
+    
+    return base
 
 
 def proxify_url(image_url: str, base_url: str) -> str:
@@ -330,13 +347,10 @@ async def proxy_image(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid URL: {str(e)}")
     
-    # Set referer default
+    # Set referer default - gunakan referer yang sama dengan Weebs_Scraper
     if not referer:
-        try:
-            parsed = urlparse(url)
-            referer = f"{parsed.scheme}://{parsed.netloc}/"
-        except:
-            referer = "https://komikcast.site/"
+        # Default referer yang work untuk komikcast images
+        referer = "https://v1.komikcast.fit"
     
     # Fetch gambar dengan header yang sesuai
     try:

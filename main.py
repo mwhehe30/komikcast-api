@@ -29,7 +29,7 @@ BASE = "https://be.komikcast.cc"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
-    "Referer": "https://v1.komikcast.fit/"
+    "Referer": "https://v2.komikcast.fit/"
 }
 
 client = httpx.AsyncClient(
@@ -350,7 +350,7 @@ async def proxy_image(
     # Set referer default - gunakan referer yang sama dengan Weebs_Scraper
     if not referer:
         # Default referer yang work untuk komikcast images
-        referer = "https://v1.komikcast.fit"
+        referer = "https://v2.komikcast.fit"
     
     # Fetch gambar dengan header yang sesuai
     try:

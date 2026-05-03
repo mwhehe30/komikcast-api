@@ -153,8 +153,7 @@ def flatten_item(item: dict) -> dict:
         return item
     merged = {**nested}
     for k, v in item.items():
-        if k != "data":
-            merged[k] = v
+        merged[k] = v
     return merged
 
 

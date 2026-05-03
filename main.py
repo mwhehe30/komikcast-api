@@ -29,17 +29,25 @@ BASE = "https://be.komikcast.cc"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9,id;q=0.8",
+    "accept-encoding": "gzip, deflate, br",
     "origin": "https://v2.komikcast.fit",
     "referer": "https://v2.komikcast.fit/",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "sec-ch-ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site",
+    "x-requested-with": "XMLHttpRequest",
 }
 
 client = httpx.AsyncClient(
     headers=HEADERS,
-    timeout=30.0
+    timeout=30.0,
+    follow_redirects=True,
+    http2=True
 )
 
 SOURCE_PAGE_SIZE = 20
@@ -152,9 +160,13 @@ async def fetch(url: str):
 
         if r.status_code != 200:
 
+            detail = "Source error"
+            if r.status_code == 403:
+                detail = f"Source blocked (403). Possible Cloudflare protection on {urlparse(url).netloc}"
+
             raise HTTPException(
                 status_code=r.status_code,
-                detail="Source error"
+                detail=detail
             )
 
         return r.json()

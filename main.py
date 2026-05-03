@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx
+from curl_cffi.requests import AsyncSession
 from typing import Any
 from urllib.parse import urlparse, quote
 
@@ -25,30 +26,16 @@ app.add_middleware(
 # CONFIG
 # ====================================
 
-BASE = "https://be.komikcast.cc"
+# Gunakan PROXY_BASE_URL jika IP diblock (contoh: Cloudflare Worker)
+BASE = os.getenv("PROXY_BASE_URL", "https://be.komikcast.cc").rstrip("/")
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "en-US,en;q=0.9,id;q=0.8",
-    "accept-encoding": "gzip, deflate, br",
     "origin": "https://v2.komikcast.fit",
     "referer": "https://v2.komikcast.fit/",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "cross-site",
     "x-requested-with": "XMLHttpRequest",
 }
-
-client = httpx.AsyncClient(
-    headers=HEADERS,
-    timeout=30.0,
-    follow_redirects=True,
-    http2=True
-)
 
 SOURCE_PAGE_SIZE = 20
 
@@ -153,30 +140,31 @@ def clean(obj: Any):
 # ====================================
 
 async def fetch(url: str):
+    """Fetch JSON from source using curl_cffi to bypass Cloudflare"""
+    async with AsyncSession() as s:
+        try:
+            # Impersonate browser TLS fingerprint
+            r = await s.get(url, impersonate="chrome124", headers=HEADERS, timeout=30)
 
-    try:
+            if r.status_code != 200:
+                detail = "Source error"
+                if r.status_code == 403:
+                    detail = f"Source blocked (403). Cloudflare detected data-center IP. Please set PROXY_BASE_URL."
+                
+                raise HTTPException(
+                    status_code=r.status_code,
+                    detail=detail
+                )
 
-        r = await client.get(url)
+            return r.json()
 
-        if r.status_code != 200:
-
-            detail = "Source error"
-            if r.status_code == 403:
-                detail = f"Source blocked (403). Possible Cloudflare protection on {urlparse(url).netloc}"
-
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
             raise HTTPException(
-                status_code=r.status_code,
-                detail=detail
+                status_code=500,
+                detail=f"Fetch error: {str(e)}"
             )
-
-        return r.json()
-
-    except httpx.RequestError:
-
-        raise HTTPException(
-            status_code=500,
-            detail="Network error"
-        )
 
 
 # ====================================
@@ -372,20 +360,17 @@ async def proxy_image(
     
     # Fetch gambar dengan header yang sesuai
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as proxy_client:
-            response = await proxy_client.get(
+        async with AsyncSession() as s:
+            response = await s.get(
                 url,
+                impersonate="chrome124",
                 headers={
                     "Referer": referer,
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
                     "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br",
                     "Connection": "keep-alive",
-                    "Sec-Fetch-Dest": "image",
-                    "Sec-Fetch-Mode": "no-cors",
-                    "Sec-Fetch-Site": "cross-site",
                 },
+                timeout=30
             )
             
             if response.status_code != 200:
@@ -408,9 +393,9 @@ async def proxy_image(
                 }
             )
             
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
     except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
 
 

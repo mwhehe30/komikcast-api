@@ -136,6 +136,33 @@ def clean(obj: Any):
 
 
 # ====================================
+# FLATTEN ITEM HELPER
+# ====================================
+
+def flatten_item(item: dict) -> dict:
+    """
+    The source API wraps all fields inside a nested 'data' key:
+      { "id": 1, "data": { "title": "...", "slug": "..." }, "chapters": [...] }
+    This merges 'data' into the top level so consumers get a flat object.
+    Top-level keys (id, createdAt, updatedAt, chapters, etc.) take precedence.
+    """
+    if not isinstance(item, dict):
+        return item
+    nested = item.get("data")
+    if not isinstance(nested, dict):
+        return item
+    merged = {**nested}
+    for k, v in item.items():
+        if k != "data":
+            merged[k] = v
+    return merged
+
+
+def flatten_items(items: list) -> list:
+    return [flatten_item(i) for i in items]
+
+
+# ====================================
 # FETCH FUNCTION
 # ====================================
 
@@ -188,7 +215,13 @@ async def root():
 async def series(
     request: Request,
     offset: int = Query(0, ge=0),
-    take: int = Query(20, ge=1, le=100)
+    take: int = Query(20, ge=1, le=100),
+    keyword: str = Query(None),
+    genres: list[str] = Query(None),
+    status: str = Query(None),
+    type: str = Query(None),
+    sort: str = Query("latest"),
+    sortOrder: str = Query("desc")
 ):
 
     # hitung page awal
@@ -200,23 +233,67 @@ async def series(
     results = []
 
     page = start_page
+    
+    # -------------------------------------------------------
+    # Build RSQL filter string
+    # The source API uses RSQL syntax:
+    #   comma (,)     = OR
+    #   semicolon (;) = AND  (avoid — causes DB pool timeout)
+    # -------------------------------------------------------
+    or_filters = []   # joined with comma  → OR
+    and_filters = []  # joined with semicolon → AND (use sparingly)
+
+    if keyword:
+        # OR: match title OR nativeTitle
+        kw = keyword.replace('"', '')  # sanitise
+        or_filters.append(f'title=like="{kw}"')
+        or_filters.append(f'nativeTitle=like="{kw}"')
+
+    if genres:
+        # API works with name-based filter; genre-ID filter returns 0 results.
+        # All genre names must be quoted strings in the in-list.
+        # Multiple genres → OR semantics (in= already handles that).
+        quoted = [f'"{g.strip()}"' for g in genres if g.strip()]
+        if quoted:
+            and_filters.append(f'genres.name=in=[{",".join(quoted)}]')
+
+    if status:
+        and_filters.append(f'status=eq="{status}"')
+
+    if type:
+        and_filters.append(f'type=eq="{type}"')
+
+    # Combine: (title OR nativeTitle) AND genre AND status AND type
+    # Build: or-block first, then wrap everything with and-block
+    filter_parts = []
+    if or_filters:
+        filter_parts.append(",".join(or_filters))  # OR group
+    filter_parts.extend(and_filters)               # AND conditions
+
+    # Join all parts with semicolon (AND), but only use semicolons for
+    # the outer AND joins — inner OR group is already comma-joined.
+    filter_query = ";".join(filter_parts) if filter_parts else None
 
     while len(results) < take:
 
         url = (
             f"{BASE}/series"
-            f"?preset=rilisan_terbaru"
-            f"&type=project"
-            f"&take={SOURCE_PAGE_SIZE}"
+            f"?take={SOURCE_PAGE_SIZE}"
             f"&takeChapter=3"
+            f"&includeMeta=true"
             f"&page={page}"
+            f"&sort={sort}"
+            f"&sortOrder={sortOrder}"
         )
+
+        if filter_query:
+            url += f"&filter={quote(filter_query)}"
 
         raw = await fetch(url)
 
         cleaned = clean(raw)
 
-        items = cleaned.get("data", [])
+        items = flatten_items(cleaned.get("data", []))
 
         if not items:
             break
@@ -234,7 +311,7 @@ async def series(
 
     # potong sesuai take
     results = results[:take]
-    
+
     # Proxify semua image URLs
     base_url = get_base_url(request)
     results = proxify_images(results, base_url)
@@ -246,6 +323,32 @@ async def series(
         "count": len(results),
         "hasMore": len(results) == take,
         "data": results
+    }
+
+
+# ====================================
+# GENRES
+# ====================================
+
+@app.get("/genres")
+async def genres(request: Request):
+
+    url = f"{BASE}/genres"
+
+    raw = await fetch(url)
+
+    # Source returns: {"data": [{"id": 1, "data": {"name": "..."}}, ...]}
+    # Use flatten_item to merge nested 'data' into top level.
+    items = flatten_items(raw.get("data", []))
+    result = clean(items)
+
+    # Proxify images (just in case there are icons)
+    base_url = get_base_url(request)
+    result = proxify_images(result, base_url)
+
+    return {
+        "status": 200,
+        "data": result
     }
 
 
@@ -400,7 +503,11 @@ async def proxy_image(
 
 
 # ====================================
-# SHUTDOWN CLEANUP
+# RUN
 # ====================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 

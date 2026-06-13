@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 import httpx
 from curl_cffi.requests import AsyncSession
 from typing import Any
-from urllib.parse import urlparse, quote
+from urllib.parse import quote
 
+import asyncio
 import os
 
 app = FastAPI()
@@ -26,8 +27,13 @@ app.add_middleware(
 # CONFIG
 # ====================================
 
-# Gunakan PROXY_BASE_URL jika IP diblock (contoh: Cloudflare Worker)
-BASE = os.getenv("PROXY_BASE_URL", "https://be.komikcast.cc").rstrip("/")
+# Gunakan SOURCE_BASE_URL jika IP Vercel dibatasi oleh API sumber.
+# PROXY_BASE_URL tetap didukung untuk kompatibilitas deployment lama.
+BASE = os.getenv(
+    "SOURCE_BASE_URL",
+    os.getenv("PROXY_BASE_URL", "https://be.komikcast.cc"),
+).rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -46,22 +52,15 @@ SOURCE_PAGE_SIZE = 20
 
 def get_base_url(request: Request) -> str:
     """Get base URL dari request untuk generate proxy URL"""
-    # Hardcode base URL dengan http (uncomment untuk pakai)
-    return "http://unofficial-komikcast-api.vercel.app"
-    
-    # base = str(request.base_url).rstrip("/")
-    # 
-    # # Option 1: Force HTTP via environment variable
-    # force_http = os.getenv("FORCE_HTTP_PROXY", "false").lower() == "true"
-    # if force_http:
-    #     base = base.replace("https://", "http://")
-    # 
-    # # Option 2: Use custom base URL from environment
-    # custom_base = os.getenv("PROXY_BASE_URL")
-    # if custom_base:
-    #     return custom_base.rstrip("/")
-    # 
-    # return base
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL.rstrip("/")
+
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    if forwarded_proto and forwarded_host:
+        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+
+    return str(request.base_url).rstrip("/")
 
 
 def proxify_url(image_url: str, base_url: str) -> str:
@@ -169,13 +168,37 @@ async def fetch(url: str):
     """Fetch JSON from source using curl_cffi to bypass Cloudflare"""
     async with AsyncSession() as s:
         try:
-            # Impersonate browser TLS fingerprint
-            r = await s.get(url, impersonate="chrome124", headers=HEADERS, timeout=30)
+            r = None
+            for attempt in range(2):
+                # Impersonate browser TLS fingerprint.
+                r = await s.get(
+                    url,
+                    impersonate="chrome124",
+                    headers=HEADERS,
+                    timeout=30,
+                )
+                if r.status_code != 429 or attempt == 1:
+                    break
+
+                retry_after = r.headers.get("retry-after", "1")
+                try:
+                    delay = min(float(retry_after), 2)
+                except ValueError:
+                    delay = 1
+                await asyncio.sleep(delay)
 
             if r.status_code != 200:
-                detail = "Source error"
+                detail = f"Source returned HTTP {r.status_code}"
                 if r.status_code == 403:
-                    detail = f"Source blocked (403). Cloudflare detected data-center IP. Please set PROXY_BASE_URL."
+                    detail = (
+                        "Source blocked the server IP (403). "
+                        "Configure SOURCE_BASE_URL with an external proxy."
+                    )
+                elif r.status_code == 429:
+                    detail = (
+                        "Source rate-limited the server IP (429). "
+                        "Retry later or configure SOURCE_BASE_URL with an external proxy."
+                    )
                 
                 raise HTTPException(
                     status_code=r.status_code,
@@ -213,6 +236,7 @@ async def root():
 @app.get("/series")
 async def series(
     request: Request,
+    response: Response,
     offset: int = Query(0, ge=0),
     take: int = Query(20, ge=1, le=100),
     keyword: str = Query(None),
@@ -314,6 +338,9 @@ async def series(
     # Proxify semua image URLs
     base_url = get_base_url(request)
     results = proxify_images(results, base_url)
+    response.headers["Cache-Control"] = (
+        "public, s-maxage=300, stale-while-revalidate=600"
+    )
 
     return {
         "status": 200,
@@ -330,7 +357,7 @@ async def series(
 # ====================================
 
 @app.get("/genres")
-async def genres(request: Request):
+async def genres(request: Request, response: Response):
 
     url = f"{BASE}/genres"
 
@@ -344,6 +371,9 @@ async def genres(request: Request):
     # Proxify images (just in case there are icons)
     base_url = get_base_url(request)
     result = proxify_images(result, base_url)
+    response.headers["Cache-Control"] = (
+        "public, s-maxage=3600, stale-while-revalidate=86400"
+    )
 
     return {
         "status": 200,
@@ -356,7 +386,7 @@ async def genres(request: Request):
 # ====================================
 
 @app.get("/series/{slug}")
-async def series_detail(request: Request, slug: str):
+async def series_detail(request: Request, response: Response, slug: str):
 
     url = f"{BASE}/series/{slug}"
 
@@ -367,6 +397,9 @@ async def series_detail(request: Request, slug: str):
     # Proxify semua image URLs
     base_url = get_base_url(request)
     cleaned = proxify_images(cleaned, base_url)
+    response.headers["Cache-Control"] = (
+        "public, s-maxage=300, stale-while-revalidate=600"
+    )
 
     return cleaned
 
@@ -376,7 +409,7 @@ async def series_detail(request: Request, slug: str):
 # ====================================
 
 @app.get("/series/{slug}/chapters")
-async def chapters(request: Request, slug: str):
+async def chapters(request: Request, response: Response, slug: str):
 
     url = f"{BASE}/series/{slug}/chapters"
 
@@ -387,6 +420,9 @@ async def chapters(request: Request, slug: str):
     # Proxify semua image URLs
     base_url = get_base_url(request)
     cleaned = proxify_images(cleaned, base_url)
+    response.headers["Cache-Control"] = (
+        "public, s-maxage=300, stale-while-revalidate=600"
+    )
 
     return cleaned
 
@@ -396,7 +432,12 @@ async def chapters(request: Request, slug: str):
 # ====================================
 
 @app.get("/series/{slug}/chapters/{chapter}")
-async def chapter_detail(request: Request, slug: str, chapter: str):
+async def chapter_detail(
+    request: Request,
+    response: Response,
+    slug: str,
+    chapter: str,
+):
 
     url = f"{BASE}/series/{slug}/chapters/{chapter}"
 
@@ -407,6 +448,9 @@ async def chapter_detail(request: Request, slug: str, chapter: str):
     # Proxify semua image URLs
     base_url = get_base_url(request)
     cleaned = proxify_images(cleaned, base_url)
+    response.headers["Cache-Control"] = (
+        "public, s-maxage=3600, stale-while-revalidate=86400"
+    )
 
     return cleaned
 

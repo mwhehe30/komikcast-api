@@ -33,13 +33,14 @@ BASE = os.getenv(
     "SOURCE_BASE_URL",
     os.getenv("PROXY_BASE_URL", "https://be.komikcast.cc"),
 ).rstrip("/")
+SOURCE_WEB_URL = os.getenv("SOURCE_WEB_URL", "https://v3.komikcast.fit").rstrip("/")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "en-US,en;q=0.9,id;q=0.8",
-    "origin": "https://v2.komikcast.fit",
-    "referer": "https://v2.komikcast.fit/",
+    "origin": SOURCE_WEB_URL,
+    "referer": f"{SOURCE_WEB_URL}/",
     "x-requested-with": "XMLHttpRequest",
 }
 
@@ -502,7 +503,7 @@ async def proxy_image(
     # Set referer default - gunakan referer yang sama dengan Weebs_Scraper
     if not referer:
         # Default referer yang work untuk komikcast images
-        referer = "https://v2.komikcast.fit"
+        referer = SOURCE_WEB_URL
     
     # Fetch gambar dengan header yang sesuai
     try:

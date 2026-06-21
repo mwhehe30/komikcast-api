@@ -1,13 +1,13 @@
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-import httpx
 from curl_cffi.requests import AsyncSession
 from typing import Any
 from urllib.parse import quote
 
 import asyncio
 import os
+import time
 
 app = FastAPI()
 
@@ -45,6 +45,27 @@ HEADERS = {
 }
 
 SOURCE_PAGE_SIZE = 20
+SOURCE_TIMEOUT_SECONDS = float(os.getenv("SOURCE_TIMEOUT_SECONDS", "30"))
+SOURCE_MAX_CONCURRENCY = int(os.getenv("SOURCE_MAX_CONCURRENCY", "2"))
+SOURCE_MIN_INTERVAL_SECONDS = float(os.getenv("SOURCE_MIN_INTERVAL_SECONDS", "0.5"))
+
+HEALTH_CACHE_TTL = int(os.getenv("HEALTH_CACHE_TTL_SECONDS", "60"))
+LIST_CACHE_TTL = int(os.getenv("LIST_CACHE_TTL_SECONDS", os.getenv("CACHE_TTL_SECONDS", "120")))
+SERIES_DETAIL_CACHE_TTL = int(os.getenv("SERIES_DETAIL_CACHE_TTL_SECONDS", "300"))
+CHAPTER_LIST_CACHE_TTL = int(os.getenv("CHAPTER_LIST_CACHE_TTL_SECONDS", "120"))
+GENRES_CACHE_TTL = int(os.getenv("GENRES_CACHE_TTL_SECONDS", "86400"))
+CHAPTER_CONTENT_CACHE_TTL = int(
+    os.getenv("CHAPTER_CONTENT_CACHE_TTL_SECONDS", os.getenv("CHAPTER_CACHE_TTL_SECONDS", "604800"))
+)
+IMAGE_CACHE_SECONDS = int(os.getenv("IMAGE_CACHE_SECONDS", "604800"))
+
+_source_session: AsyncSession | None = None
+_source_semaphore = asyncio.Semaphore(SOURCE_MAX_CONCURRENCY)
+_source_rate_lock = asyncio.Lock()
+_source_last_request_at = 0.0
+_json_cache: dict[str, tuple[float, Any]] = {}
+_json_inflight: dict[str, asyncio.Future] = {}
+_json_cache_lock = asyncio.Lock()
 
 
 # ====================================
@@ -165,56 +186,135 @@ def flatten_items(items: list) -> list:
 # FETCH FUNCTION
 # ====================================
 
-async def fetch(url: str):
-    """Fetch JSON from source using curl_cffi to bypass Cloudflare"""
-    async with AsyncSession() as s:
-        try:
-            r = None
+async def get_source_session() -> AsyncSession:
+    global _source_session
+
+    if _source_session is None:
+        _source_session = AsyncSession()
+    return _source_session
+
+
+@app.on_event("shutdown")
+async def close_source_session():
+    global _source_session
+
+    if _source_session is not None:
+        await _source_session.close()
+        _source_session = None
+
+
+async def wait_for_source_slot():
+    global _source_last_request_at
+
+    async with _source_rate_lock:
+        elapsed = time.monotonic() - _source_last_request_at
+        if elapsed < SOURCE_MIN_INTERVAL_SECONDS:
+            await asyncio.sleep(SOURCE_MIN_INTERVAL_SECONDS - elapsed)
+        _source_last_request_at = time.monotonic()
+
+
+def get_cached_json(url: str) -> Any | None:
+    cached = _json_cache.get(url)
+    if not cached:
+        return None
+
+    expires_at, data = cached
+    if expires_at <= time.monotonic():
+        _json_cache.pop(url, None)
+        return None
+
+    return data
+
+
+async def fetch_uncached(url: str):
+    """Fetch JSON from source with shared session and conservative pacing."""
+    try:
+        session = await get_source_session()
+        r = None
+
+        async with _source_semaphore:
             for attempt in range(2):
-                # Impersonate browser TLS fingerprint.
-                r = await s.get(
+                await wait_for_source_slot()
+                r = await session.get(
                     url,
                     impersonate="chrome124",
                     headers=HEADERS,
-                    timeout=30,
+                    timeout=SOURCE_TIMEOUT_SECONDS,
                 )
                 if r.status_code != 429 or attempt == 1:
                     break
 
-                retry_after = r.headers.get("retry-after", "1")
+                retry_after = r.headers.get("retry-after", "2")
                 try:
-                    delay = min(float(retry_after), 2)
+                    delay = min(float(retry_after), 5)
                 except ValueError:
-                    delay = 1
+                    delay = 2
                 await asyncio.sleep(delay)
 
-            if r.status_code != 200:
-                detail = f"Source returned HTTP {r.status_code}"
-                if r.status_code == 403:
-                    detail = (
-                        "Source blocked the server IP (403). "
-                        "Configure SOURCE_BASE_URL with an external proxy."
-                    )
-                elif r.status_code == 429:
-                    detail = (
-                        "Source rate-limited the server IP (429). "
-                        "Retry later or configure SOURCE_BASE_URL with an external proxy."
-                    )
-                
-                raise HTTPException(
-                    status_code=r.status_code,
-                    detail=detail
+        if r.status_code != 200:
+            detail = f"Source returned HTTP {r.status_code}"
+            if r.status_code == 403:
+                detail = (
+                    "Source blocked the server IP (403). "
+                    "Configure SOURCE_BASE_URL with an external proxy."
+                )
+            elif r.status_code == 429:
+                detail = (
+                    "Source rate-limited the server IP (429). "
+                    "Retry later or configure SOURCE_BASE_URL with an external proxy."
                 )
 
-            return r.json()
+            raise HTTPException(status_code=r.status_code, detail=detail)
 
-        except Exception as e:
-            if isinstance(e, HTTPException):
-                raise e
-            raise HTTPException(
-                status_code=500,
-                detail=f"Fetch error: {str(e)}"
+        return r.json()
+
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Fetch error: {str(e)}")
+
+
+async def fetch(url: str, ttl: int = LIST_CACHE_TTL, cache_key: str | None = None):
+    """Fetch JSON from source, cache it, and coalesce duplicate in-flight calls."""
+    cache_key = cache_key or url
+
+    if ttl > 0:
+        cached = get_cached_json(cache_key)
+        if cached is not None:
+            return cached
+
+    async with _json_cache_lock:
+        if ttl > 0:
+            cached = get_cached_json(cache_key)
+            if cached is not None:
+                return cached
+
+        future = _json_inflight.get(cache_key)
+        if future is None:
+            future = asyncio.get_running_loop().create_future()
+            future.add_done_callback(
+                lambda f: f.exception() if not f.cancelled() else None
             )
+            _json_inflight[cache_key] = future
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        return await future
+
+    try:
+        data = await fetch_uncached(url)
+        if ttl > 0:
+            _json_cache[cache_key] = (time.monotonic() + ttl, data)
+        future.set_result(data)
+        return data
+    except Exception as e:
+        future.set_exception(e)
+        raise
+    finally:
+        async with _json_cache_lock:
+            _json_inflight.pop(cache_key, None)
 
 
 # ====================================
@@ -222,11 +322,59 @@ async def fetch(url: str):
 # ====================================
 
 @app.get("/")
-async def root():
+async def root(response: Response):
+    health_url = f"{BASE}/genres"
+    routes = [
+        "/",
+        "/series",
+        "/genres",
+        "/series/{slug}",
+        "/series/{slug}/chapters",
+        "/series/{slug}/chapters/{chapter}",
+        "/proxy",
+    ]
+
+    try:
+        await fetch(
+            health_url,
+            ttl=HEALTH_CACHE_TTL,
+            cache_key=f"health:{health_url}",
+        )
+        source = {
+            "status": "ok",
+            "baseUrl": BASE,
+        }
+        status = "ok"
+        status_code = 200
+        message = "Komikcast API is running"
+    except HTTPException as e:
+        status = "error"
+        status_code = 503
+        response.status_code = status_code
+        source = {
+            "status": "error",
+            "baseUrl": BASE,
+            "httpStatus": e.status_code,
+            "detail": e.detail,
+        }
+        message = "Komikcast source is not reachable"
+    except Exception as e:
+        status = "error"
+        status_code = 503
+        response.status_code = status_code
+        source = {
+            "status": "error",
+            "baseUrl": BASE,
+            "detail": str(e),
+        }
+        message = "Komikcast API health check failed"
 
     return {
-        "status": 200,
-        "message": "Komikcast API with offset pagination"
+        "status": status,
+        "statusCode": status_code,
+        "message": message,
+        "source": source,
+        "routes": routes,
     }
 
 
@@ -313,7 +461,7 @@ async def series(
         if filter_query:
             url += f"&filter={quote(filter_query)}"
 
-        raw = await fetch(url)
+        raw = await fetch(url, ttl=LIST_CACHE_TTL)
 
         cleaned = clean(raw)
 
@@ -340,7 +488,7 @@ async def series(
     base_url = get_base_url(request)
     results = proxify_images(results, base_url)
     response.headers["Cache-Control"] = (
-        "public, s-maxage=300, stale-while-revalidate=600"
+        f"public, s-maxage={LIST_CACHE_TTL}, stale-while-revalidate={LIST_CACHE_TTL * 2}"
     )
 
     return {
@@ -362,7 +510,7 @@ async def genres(request: Request, response: Response):
 
     url = f"{BASE}/genres"
 
-    raw = await fetch(url)
+    raw = await fetch(url, ttl=GENRES_CACHE_TTL)
 
     # Source returns: {"data": [{"id": 1, "data": {"name": "..."}}, ...]}
     # Use flatten_item to merge nested 'data' into top level.
@@ -373,7 +521,7 @@ async def genres(request: Request, response: Response):
     base_url = get_base_url(request)
     result = proxify_images(result, base_url)
     response.headers["Cache-Control"] = (
-        "public, s-maxage=3600, stale-while-revalidate=86400"
+        f"public, s-maxage={GENRES_CACHE_TTL}, stale-while-revalidate={GENRES_CACHE_TTL}"
     )
 
     return {
@@ -391,7 +539,7 @@ async def series_detail(request: Request, response: Response, slug: str):
 
     url = f"{BASE}/series/{slug}"
 
-    raw = await fetch(url)
+    raw = await fetch(url, ttl=SERIES_DETAIL_CACHE_TTL)
     
     cleaned = clean(raw)
     
@@ -399,7 +547,7 @@ async def series_detail(request: Request, response: Response, slug: str):
     base_url = get_base_url(request)
     cleaned = proxify_images(cleaned, base_url)
     response.headers["Cache-Control"] = (
-        "public, s-maxage=300, stale-while-revalidate=600"
+        f"public, s-maxage={SERIES_DETAIL_CACHE_TTL}, stale-while-revalidate={SERIES_DETAIL_CACHE_TTL * 2}"
     )
 
     return cleaned
@@ -414,7 +562,7 @@ async def chapters(request: Request, response: Response, slug: str):
 
     url = f"{BASE}/series/{slug}/chapters"
 
-    raw = await fetch(url)
+    raw = await fetch(url, ttl=CHAPTER_LIST_CACHE_TTL)
     
     cleaned = clean(raw)
     
@@ -422,7 +570,7 @@ async def chapters(request: Request, response: Response, slug: str):
     base_url = get_base_url(request)
     cleaned = proxify_images(cleaned, base_url)
     response.headers["Cache-Control"] = (
-        "public, s-maxage=300, stale-while-revalidate=600"
+        f"public, s-maxage={CHAPTER_LIST_CACHE_TTL}, stale-while-revalidate={CHAPTER_LIST_CACHE_TTL * 2}"
     )
 
     return cleaned
@@ -442,7 +590,7 @@ async def chapter_detail(
 
     url = f"{BASE}/series/{slug}/chapters/{chapter}"
 
-    raw = await fetch(url)
+    raw = await fetch(url, ttl=CHAPTER_CONTENT_CACHE_TTL)
     
     cleaned = clean(raw)
     
@@ -450,7 +598,7 @@ async def chapter_detail(
     base_url = get_base_url(request)
     cleaned = proxify_images(cleaned, base_url)
     response.headers["Cache-Control"] = (
-        "public, s-maxage=3600, stale-while-revalidate=86400"
+        f"public, s-maxage={CHAPTER_CONTENT_CACHE_TTL}, stale-while-revalidate={CHAPTER_CONTENT_CACHE_TTL}"
     )
 
     return cleaned
@@ -507,8 +655,10 @@ async def proxy_image(
     
     # Fetch gambar dengan header yang sesuai
     try:
-        async with AsyncSession() as s:
-            response = await s.get(
+        session = await get_source_session()
+        async with _source_semaphore:
+            await wait_for_source_slot()
+            response = await session.get(
                 url,
                 impersonate="chrome124",
                 headers={
@@ -517,7 +667,7 @@ async def proxy_image(
                     "Accept-Language": "en-US,en;q=0.9",
                     "Connection": "keep-alive",
                 },
-                timeout=30
+                timeout=SOURCE_TIMEOUT_SECONDS
             )
             
             if response.status_code != 200:
@@ -535,7 +685,7 @@ async def proxy_image(
                 iter([response.content]),
                 media_type=response.headers.get("content-type", "image/jpeg"),
                 headers={
-                    "Cache-Control": "public, max-age=86400",
+                    "Cache-Control": f"public, max-age={IMAGE_CACHE_SECONDS}",
                     "Access-Control-Allow-Origin": "*"
                 }
             )

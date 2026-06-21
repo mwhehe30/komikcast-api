@@ -20,3 +20,25 @@ Override it only when the source frontend domain changes:
 ```text
 SOURCE_WEB_URL=https://v3.komikcast.fit
 ```
+
+## Source request control
+
+The API keeps a short in-memory cache and coalesces duplicate in-flight
+requests so repeated client calls do not always hit the Komikcast source.
+Tune these values when deploying:
+
+```text
+HEALTH_CACHE_TTL_SECONDS=60
+LIST_CACHE_TTL_SECONDS=120
+SERIES_DETAIL_CACHE_TTL_SECONDS=300
+CHAPTER_LIST_CACHE_TTL_SECONDS=120
+GENRES_CACHE_TTL_SECONDS=86400
+CHAPTER_CONTENT_CACHE_TTL_SECONDS=604800
+IMAGE_CACHE_SECONDS=604800
+SOURCE_MAX_CONCURRENCY=2
+SOURCE_MIN_INTERVAL_SECONDS=0.5
+SOURCE_TIMEOUT_SECONDS=30
+```
+
+`CACHE_TTL_SECONDS` and `CHAPTER_CACHE_TTL_SECONDS` are still accepted as
+fallbacks for older deployments.

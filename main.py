@@ -27,14 +27,39 @@ app.add_middleware(
 # CONFIG
 # ====================================
 
-# Gunakan SOURCE_BASE_URL jika IP Vercel dibatasi oleh API sumber.
-# PROXY_BASE_URL tetap didukung untuk kompatibilitas deployment lama.
-BASE = os.getenv(
-    "SOURCE_BASE_URL",
-    os.getenv("PROXY_BASE_URL", "https://be.komikcast.cc"),
-).rstrip("/")
+DEFAULT_SOURCE = "https://be.komikcast.cc"
+
+
+def get_source_bases() -> list[str]:
+    """Ordered source base URLs. Direct API is always kept as final fallback."""
+    bases: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: str | None) -> None:
+        if not url:
+            return
+        normalized = url.strip().rstrip("/")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            bases.append(normalized)
+
+    add(os.getenv("SOURCE_BASE_URL") or os.getenv("PROXY_BASE_URL"))
+
+    for part in os.getenv("SOURCE_FALLBACK_URLS", DEFAULT_SOURCE).split(","):
+        add(part)
+
+    add(DEFAULT_SOURCE)
+
+    worker_bases = [base for base in bases if "workers.dev" in base]
+    regular_bases = [base for base in bases if "workers.dev" not in base]
+    return regular_bases + worker_bases
+
+
+SOURCE_BASES = get_source_bases()
+BASE = SOURCE_BASES[0]
 SOURCE_WEB_URL = os.getenv("SOURCE_WEB_URL", "https://v3.komikcast.fit").rstrip("/")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+SOURCE_RETRYABLE_STATUSES = {403, 429, 502, 503, 504}
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -64,8 +89,10 @@ _source_semaphore = asyncio.Semaphore(SOURCE_MAX_CONCURRENCY)
 _source_rate_lock = asyncio.Lock()
 _source_last_request_at = 0.0
 _json_cache: dict[str, tuple[float, Any]] = {}
+_stale_cache: dict[str, Any] = {}
 _json_inflight: dict[str, asyncio.Future] = {}
 _json_cache_lock = asyncio.Lock()
+_last_successful_base: str | None = None
 
 
 # ====================================
@@ -226,57 +253,89 @@ def get_cached_json(url: str) -> Any | None:
     return data
 
 
-async def fetch_uncached(url: str):
-    """Fetch JSON from source with shared session and conservative pacing."""
-    try:
-        session = await get_source_session()
-        r = None
-
-        async with _source_semaphore:
-            for attempt in range(2):
-                await wait_for_source_slot()
-                r = await session.get(
-                    url,
-                    impersonate="chrome124",
-                    headers=HEADERS,
-                    timeout=SOURCE_TIMEOUT_SECONDS,
-                )
-                if r.status_code != 429 or attempt == 1:
-                    break
-
-                retry_after = r.headers.get("retry-after", "2")
-                try:
-                    delay = min(float(retry_after), 5)
-                except ValueError:
-                    delay = 2
-                await asyncio.sleep(delay)
-
-        if r.status_code != 200:
-            detail = f"Source returned HTTP {r.status_code}"
-            if r.status_code == 403:
-                detail = (
-                    "Source blocked the server IP (403). "
-                    "Configure SOURCE_BASE_URL with an external proxy."
-                )
-            elif r.status_code == 429:
-                detail = (
-                    "Source rate-limited the server IP (429). "
-                    "Retry later or configure SOURCE_BASE_URL with an external proxy."
-                )
-
-            raise HTTPException(status_code=r.status_code, detail=detail)
-
-        return r.json()
-
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=f"Fetch error: {str(e)}")
+def source_error_detail(status_code: int, base_url: str) -> str:
+    if status_code == 403:
+        return (
+            f"Source blocked requests from {base_url} (403). "
+            "Trying fallback sources if configured."
+        )
+    if status_code == 429:
+        return (
+            f"Source rate-limited requests from {base_url} (429). "
+            "Trying fallback sources if configured."
+        )
+    return f"Source returned HTTP {status_code} from {base_url}"
 
 
-async def fetch(url: str, ttl: int = LIST_CACHE_TTL, cache_key: str | None = None):
+async def fetch_url_once(url: str):
+    """Fetch JSON from one source URL with shared session and conservative pacing."""
+    session = await get_source_session()
+    r = None
+
+    async with _source_semaphore:
+        for attempt in range(3):
+            await wait_for_source_slot()
+            r = await session.get(
+                url,
+                impersonate="chrome124",
+                headers=HEADERS,
+                timeout=SOURCE_TIMEOUT_SECONDS,
+            )
+            if r.status_code != 429 or attempt == 2:
+                break
+
+            retry_after = r.headers.get("retry-after", "2")
+            try:
+                delay = min(float(retry_after), 5)
+            except ValueError:
+                delay = 2
+            await asyncio.sleep(delay)
+
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=source_error_detail(r.status_code, url),
+        )
+
+    return r.json()
+
+
+async def fetch_uncached(path: str):
+    """Fetch JSON from source, failing over across configured base URLs."""
+    global _last_successful_base
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    last_error: HTTPException | None = None
+
+    for base in get_source_bases():
+        url = f"{base}{path}"
+        try:
+            data = await fetch_url_once(url)
+            _last_successful_base = base
+            return data
+        except HTTPException as e:
+            if e.status_code in SOURCE_RETRYABLE_STATUSES:
+                last_error = e
+                continue
+            raise
+        except Exception as e:
+            last_error = HTTPException(status_code=500, detail=f"Fetch error: {str(e)}")
+            continue
+
+    if last_error is not None:
+        raise last_error
+
+    raise HTTPException(status_code=503, detail="All Komikcast sources failed")
+
+
+async def fetch(path: str, ttl: int = LIST_CACHE_TTL, cache_key: str | None = None):
     """Fetch JSON from source, cache it, and coalesce duplicate in-flight calls."""
-    cache_key = cache_key or url
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    cache_key = cache_key or path
 
     if ttl > 0:
         cached = get_cached_json(cache_key)
@@ -304,12 +363,17 @@ async def fetch(url: str, ttl: int = LIST_CACHE_TTL, cache_key: str | None = Non
         return await future
 
     try:
-        data = await fetch_uncached(url)
+        data = await fetch_uncached(path)
         if ttl > 0:
             _json_cache[cache_key] = (time.monotonic() + ttl, data)
+        _stale_cache[cache_key] = data
         future.set_result(data)
         return data
     except Exception as e:
+        stale = _stale_cache.get(cache_key)
+        if stale is not None:
+            future.set_result(stale)
+            return stale
         future.set_exception(e)
         raise
     finally:
@@ -323,7 +387,7 @@ async def fetch(url: str, ttl: int = LIST_CACHE_TTL, cache_key: str | None = Non
 
 @app.get("/")
 async def root(response: Response):
-    health_url = f"{BASE}/genres"
+    health_path = "/genres"
     routes = [
         "/",
         "/series",
@@ -336,13 +400,15 @@ async def root(response: Response):
 
     try:
         await fetch(
-            health_url,
+            health_path,
             ttl=HEALTH_CACHE_TTL,
-            cache_key=f"health:{health_url}",
+            cache_key=f"health:{health_path}",
         )
+        active_base = _last_successful_base or BASE
         source = {
             "status": "ok",
-            "baseUrl": BASE,
+            "baseUrl": active_base,
+            "configuredBases": get_source_bases(),
         }
         status = "ok"
         status_code = 200
@@ -354,6 +420,7 @@ async def root(response: Response):
         source = {
             "status": "error",
             "baseUrl": BASE,
+            "configuredBases": get_source_bases(),
             "httpStatus": e.status_code,
             "detail": e.detail,
         }
@@ -365,6 +432,7 @@ async def root(response: Response):
         source = {
             "status": "error",
             "baseUrl": BASE,
+            "configuredBases": get_source_bases(),
             "detail": str(e),
         }
         message = "Komikcast API health check failed"
@@ -448,8 +516,8 @@ async def series(
 
     while len(results) < take:
 
-        url = (
-            f"{BASE}/series"
+        path = (
+            f"/series"
             f"?take={SOURCE_PAGE_SIZE}"
             f"&takeChapter=3"
             f"&includeMeta=true"
@@ -459,9 +527,9 @@ async def series(
         )
 
         if filter_query:
-            url += f"&filter={quote(filter_query)}"
+            path += f"&filter={quote(filter_query)}"
 
-        raw = await fetch(url, ttl=LIST_CACHE_TTL)
+        raw = await fetch(path, ttl=LIST_CACHE_TTL)
 
         cleaned = clean(raw)
 
@@ -508,9 +576,7 @@ async def series(
 @app.get("/genres")
 async def genres(request: Request, response: Response):
 
-    url = f"{BASE}/genres"
-
-    raw = await fetch(url, ttl=GENRES_CACHE_TTL)
+    raw = await fetch("/genres", ttl=GENRES_CACHE_TTL)
 
     # Source returns: {"data": [{"id": 1, "data": {"name": "..."}}, ...]}
     # Use flatten_item to merge nested 'data' into top level.
@@ -537,9 +603,7 @@ async def genres(request: Request, response: Response):
 @app.get("/series/{slug}")
 async def series_detail(request: Request, response: Response, slug: str):
 
-    url = f"{BASE}/series/{slug}"
-
-    raw = await fetch(url, ttl=SERIES_DETAIL_CACHE_TTL)
+    raw = await fetch(f"/series/{slug}", ttl=SERIES_DETAIL_CACHE_TTL)
     
     cleaned = clean(raw)
     
@@ -560,9 +624,7 @@ async def series_detail(request: Request, response: Response, slug: str):
 @app.get("/series/{slug}/chapters")
 async def chapters(request: Request, response: Response, slug: str):
 
-    url = f"{BASE}/series/{slug}/chapters"
-
-    raw = await fetch(url, ttl=CHAPTER_LIST_CACHE_TTL)
+    raw = await fetch(f"/series/{slug}/chapters", ttl=CHAPTER_LIST_CACHE_TTL)
     
     cleaned = clean(raw)
     
@@ -588,9 +650,10 @@ async def chapter_detail(
     chapter: str,
 ):
 
-    url = f"{BASE}/series/{slug}/chapters/{chapter}"
-
-    raw = await fetch(url, ttl=CHAPTER_CONTENT_CACHE_TTL)
+    raw = await fetch(
+        f"/series/{slug}/chapters/{chapter}",
+        ttl=CHAPTER_CONTENT_CACHE_TTL,
+    )
     
     cleaned = clean(raw)
     
